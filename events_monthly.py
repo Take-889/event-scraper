@@ -212,4 +212,3 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
-``
