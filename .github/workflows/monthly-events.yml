@@ -34,6 +34,7 @@ jobs:
           path: |
             _debug_*.html
             events_agg.csv
+            events_agg.xlsx
 
       # ▼ その後にコミット（失敗してもOK）
       - name: Commit CSV
