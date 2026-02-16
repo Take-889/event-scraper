@@ -7,6 +7,20 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 
+
+# --- デバッグ: 取得したHTMLを保存（Artifactsで参照するため） ---
+def _save_debug(name: str, text: str):
+    """
+    取得したHTMLを _debug_*.html として保存します。
+    GitHub Actions 側で upload-artifact してダウンロード・目視確認できます。
+    """
+    import os
+    # ワークスペース直下に保存
+    fn = f"_debug_{name}.html"
+    with open(fn, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 # -------- 共通: 日付パース（柔軟な和暦/日本語表記対応の簡易版） --------
 def parse_date_range(text):
     """
@@ -40,36 +54,35 @@ def parse_date_range(text):
 
 # -------- A) 科学カレンダー（kagaku.com） --------
 # 例: 全学協会（society_all）×全地域
-KAGAKU_URL = "https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
+def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"):
+    import requests
+    from bs4 import BeautifulSoup
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
 
-def fetch_kagaku():
-    resp = requests.get(KAGAKU_URL, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # ★デバッグ保存
+    _save_debug("kagaku", r.text)
+
+    soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
     rows = []
     if not table:
         return pd.DataFrame(rows)
 
+    import re
     for tr in table.find_all("tr"):
-        # セルテキスト
         tds = tr.find_all(['td','th'])
         if len(tds) < 3:
             continue
         texts = [td.get_text(strip=True) for td in tds]
-        # 見出し行などのスキップ条件（"イベントの名称"等が含まれる）
         header_like = any(k in "".join(texts) for k in ["イベント", "会期"])
         if header_like and tr.find('th'):
             continue
 
-        # 想定： [イベント名, 年(省略可), 会期, 場所] の並びが多い
         title = texts[0]
-
-        # 主催者サイトURL（リンク先）
         a = tr.find("a", href=True)
         link = a["href"] if a else None
 
-        # 会期っぽい列を抽出（数字/スラッシュ/年・月・日が含まれる）
         dr = None
         for tx in texts:
             if re.search(r'\d{1,2}/\d{1,2}', tx) or ('年' in tx and '月' in tx):
@@ -90,40 +103,38 @@ def fetch_kagaku():
     return pd.DataFrame(rows)
 
 # -------- B) 東京ビッグサイト（bigsight.jp） --------
-BIGSIGHT_URL = "https://www.bigsight.jp/visitor/event/"
-
-def fetch_bigsight():
+def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/"):
+    import requests
+    from bs4 import BeautifulSoup
     events = []
     page = 1
     while True:
-        u = BIGSIGHT_URL if page == 1 else f"{BIGSIGHT_URL}?page={page}"
+        u = url if page == 1 else f"{url}?page={page}"
         r = requests.get(u, timeout=30)
         if r.status_code != 200:
             break
-        soup = BeautifulSoup(r.text, "html.parser")
 
-        # カードアイテム（構造が変わることがあるため、複数候補で探す）
+        # ★デバッグ保存（ページごと）
+        _save_debug(f"bigsight_p{page}", r.text)
+
+        soup = BeautifulSoup(r.text, "html.parser")
         cards = soup.select("div.l-event__item, li.l-event__item")
         if not cards:
             break
 
         for c in cards:
-            # タイトル
             ttl_el = c.select_one(".l-event__ttl") or c.select_one("h3")
             title = ttl_el.get_text(strip=True) if ttl_el else None
 
-            # まとまったテキストから会期らしき部分を拾う
             block_text = c.get_text(" ", strip=True)
+            import re
             m = re.search(r'(\d{4}年?\d{1,2}月?\d{1,2}日?.*?〜?.*?\d{1,2}月?\d{1,2}日?)', block_text)
             start, end = parse_date_range(m.group(1)) if m else (None, None)
 
-            # 主催サイトURL（カード内の外部リンク）
             link = None
             for a in c.find_all("a", href=True):
-                # 公式の詳細ページ（bigsight.jp内）より、まず外部URLを優先
                 if a['href'].startswith("http") and "bigsight.jp" not in a['href']:
                     link = a['href']; break
-            # 見つからなければ最初のリンク
             if not link:
                 a = c.find("a", href=True)
                 link = a['href'] if a else None
@@ -141,42 +152,43 @@ def fetch_bigsight():
     return pd.DataFrame(events)
 
 # -------- C) 幕張メッセ（印刷用） --------
-MAKUHARI_PRINT_URL = "https://www.m-messe.co.jp/event/print"
-
-def fetch_makuhari():
-    r = requests.get(MAKUHARI_PRINT_URL, timeout=30)
+def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
+    import requests
+    from bs4 import BeautifulSoup
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
+
+    # ★デバッグ保存
+    _save_debug("makuhari", r.text)
+
     soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
     rows = []
     if not table:
         return pd.DataFrame(rows)
-
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2:
             continue
         vals = [td.get_text(" ", strip=True) for td in tds]
-
-        # 多くの行は [会期, イベント名, 会場, 対象・入場料, 連絡先...] 構造
         dr = vals[0]
         title = vals[1] if len(vals) > 1 else None
         venue = vals[2] if len(vals) > 2 else None
         start, end = parse_date_range(dr)
 
-        # 連絡先・URL抽出（後続セルを結合してURLを拾う）
+        import re
         tail = " ".join(vals[3:]) if len(vals) > 3 else ""
         murl = re.search(r'(https?://[^\s]+)', tail)
         link = murl.group(1) if murl else None
 
         if title and (start or end):
             rows.append({
-                "source": "makuhari",
-                "title": title,
-                "start_date": start,
-                "end_date": end,
-                "venue": venue,
-                "url": link
+                'source': 'makuhari',
+                'title': title,
+                'start_date': start,
+                'end_date': end,
+                'venue': venue,
+                'url': link
             })
     return pd.DataFrame(rows)
 
@@ -212,3 +224,7 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
+if __name__ == "__main__":
+    monthly_run()
+
