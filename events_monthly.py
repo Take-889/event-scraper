@@ -104,65 +104,56 @@ def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_al
 
 # -------- B) 東京ビッグサイト（bigsight.jp） --------
 def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/"):
-    import requests
+    import requests, re
     from bs4 import BeautifulSoup
-    import re
 
-    events = []
-
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0; +https://github.com/your/repo)"
-    }
-
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0; +https://github.com/your/repo)"}
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
 
-    _save_debug("bigsight_latest", r.text)
-
+    _save_debug("bigsight_latest", r.text)  # デバッグHTML保存（Artifactsで確認可）
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 1) 各イベントブロックを抽出（タイトル行を探す方式）
-    # BigSight 現行の DOM は h3 や div でイベント名を持っている
-    title_nodes = soup.find_all(["h3", "div"], string=True)
-
-    for node in title_nodes:
-        title = node.get_text(strip=True)
-
-        # HCJ2026… や Eight EXPO… のような “タイトルっぽい文字列” のみ拾う
-        if len(title) < 5:
+    events = []
+    # タイトルらしき要素を広く拾いつつ、「開催期間」を持つブロックのみ残す
+    for title_node in soup.find_all(["h3", "h2", "div"], string=True):
+        title = title_node.get_text(strip=True)
+        if not title or len(title) < 5:
             continue
 
-        # 次の兄弟ノードに詳細情報が続く構造
-        detail_block = node.find_next_sibling()
+        # タイトルの次に続く詳細ブロック
+        detail = title_node.find_next_sibling()
+        if not detail:
+            continue
 
-        if detail_block:
-            text_block = detail_block.get_text(" ", strip=True)
+        block_text = detail.get_text(" ", strip=True)
 
-            # 開催期間の抽出
-            m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}月\d{1,2}日)', text_block)
-            if m:
-                start, end = parse_date_range(m.group(1))
-            else:
-                start, end = (None, None)
+        # 「開催期間」が無ければ UI 見出し等と判断して除外
+        if "開催期間" not in block_text:
+            continue
 
-            # URL 抽出
-            a = detail_block.find("a", href=True)
-            link = a["href"] if a else None
+        # 会期抽出
+        m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}月\d{1,2}日)', block_text)
+        start, end = parse_date_range(m.group(1)) if m else (None, None)
 
-            # 会場（利用施設）抽出
-            venue = None
-            m2 = re.search(r'利用施設\s*([^\s]+)', text_block)
-            if m2:
-                venue = m2.group(1)
+        # URL（主催サイト）抽出
+        a = detail.find("a", href=True)
+        link = a["href"] if a else None
 
-            events.append({
-                "source": "bigsight",
-                "title": title,
-                "start_date": start,
-                "end_date": end,
-                "venue": venue,
-                "url": link
-            })
+        # 会場（「利用施設 …」）
+        venue = None
+        m2 = re.search(r'利用施設\s*([^\s]+)', block_text)
+        if m2:
+            venue = m2.group(1)
+
+        events.append({
+            "source": "bigsight",
+            "title": title,
+            "start_date": start,
+            "end_date": end,
+            "venue": venue,
+            "url": link
+        })
 
     return pd.DataFrame(events)
 
@@ -234,7 +225,7 @@ def monthly_run(output_csv="events_agg.csv"):
     all_df = all_df.drop_duplicates(subset=["title","start_date"])
 
     # CSV出力
-    all_df.to_csv(output_csv, index=False, encoding="utf-8")
+    all_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"Saved: {output_csv} ({len(all_df)} rows)")
 
 if __name__ == "__main__":
@@ -242,5 +233,6 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
