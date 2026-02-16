@@ -106,49 +106,64 @@ def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_al
 def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/"):
     import requests
     from bs4 import BeautifulSoup
+    import re
+
     events = []
-    page = 1
-    while True:
-        u = url if page == 1 else f"{url}?page={page}"
-        r = requests.get(u, timeout=30)
-        if r.status_code != 200:
-            break
 
-        # ★デバッグ保存（ページごと）
-        _save_debug(f"bigsight_p{page}", r.text)
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0; +https://github.com/your/repo)"
+    }
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select("div.l-event__item, li.l-event__item")
-        if not cards:
-            break
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
 
-        for c in cards:
-            ttl_el = c.select_one(".l-event__ttl") or c.select_one("h3")
-            title = ttl_el.get_text(strip=True) if ttl_el else None
+    _save_debug("bigsight_latest", r.text)
 
-            block_text = c.get_text(" ", strip=True)
-            import re
-            m = re.search(r'(\d{4}年?\d{1,2}月?\d{1,2}日?.*?〜?.*?\d{1,2}月?\d{1,2}日?)', block_text)
-            start, end = parse_date_range(m.group(1)) if m else (None, None)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-            link = None
-            for a in c.find_all("a", href=True):
-                if a['href'].startswith("http") and "bigsight.jp" not in a['href']:
-                    link = a['href']; break
-            if not link:
-                a = c.find("a", href=True)
-                link = a['href'] if a else None
+    # 1) 各イベントブロックを抽出（タイトル行を探す方式）
+    # BigSight 現行の DOM は h3 や div でイベント名を持っている
+    title_nodes = soup.find_all(["h3", "div"], string=True)
 
-            if title and (start or end):
-                events.append({
-                    "source": "bigsight",
-                    "title": title,
-                    "start_date": start,
-                    "end_date": end,
-                    "venue": None,
-                    "url": link
-                })
-        page += 1
+    for node in title_nodes:
+        title = node.get_text(strip=True)
+
+        # HCJ2026… や Eight EXPO… のような “タイトルっぽい文字列” のみ拾う
+        if len(title) < 5:
+            continue
+
+        # 次の兄弟ノードに詳細情報が続く構造
+        detail_block = node.find_next_sibling()
+
+        if detail_block:
+            text_block = detail_block.get_text(" ", strip=True)
+
+            # 開催期間の抽出
+            m = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}月\d{1,2}日)', text_block)
+            if m:
+                start, end = parse_date_range(m.group(1))
+            else:
+                start, end = (None, None)
+
+            # URL 抽出
+            a = detail_block.find("a", href=True)
+            link = a["href"] if a else None
+
+            # 会場（利用施設）抽出
+            venue = None
+            m2 = re.search(r'利用施設\s*([^\s]+)', text_block)
+            if m2:
+                venue = m2.group(1)
+
+            events.append({
+                "source": "bigsight",
+                "title": title,
+                "start_date": start,
+                "end_date": end,
+                "venue": venue,
+                "url": link
+            })
+
     return pd.DataFrame(events)
 
 # -------- C) 幕張メッセ（印刷用） --------
@@ -227,4 +242,5 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
