@@ -34,13 +34,6 @@ def _save_debug(name: str, text: str):
 
 # -------- 共通: 日付パース（柔軟な和暦/日本語表記対応） --------
 def parse_date_range(text):
-    """
-    '2026年02月18日（水）～2026年02月20日（金）' /
-    '2/18 水－2/20 金' / '2/16月−2/18水' 等から (YYYY-MM-DD, YYYY-MM-DD) を返す。
-    ・括弧内（曜日など）を削除
-    ・年/月/日 をスラッシュに正規化
-    ・各種ダッシュ/波線を統一
-    """
     if not text:
         return None, None
     t = str(text)
@@ -49,13 +42,13 @@ def parse_date_range(text):
     t = re.sub(r'[（(].*?[）)]', '', t)
     # 2) 空白類の削除
     t = re.sub(r'\s+', '', t)
-
     # 3) 区切り記号の統一（すべて '〜' に）
     for ch in ['〜', '～', '-', '−', '—', '–', '－', '―']:
         t = t.replace(ch, '〜')
-
     # 4) 年月日 → スラッシュに正規化（年→/、月→/、日→削除）
     t = t.replace('年', '/').replace('月', '/').replace('日', '')
+    # 5) 曜日文字の除去（括弧なしの 月火水木金土日・曜 を最後に落とす）
+    t = re.sub(r'[月火水木金土日曜]', '', t)
 
     parts = t.split('〜')
 
@@ -165,9 +158,14 @@ def fetch_kagaku(
             title = a_any.get_text(" ", strip=True)
             link = a_any.get("href")
 
-            # URL 絶対化 & http(s) 必須 & 末尾ノイズ除去
-            if link and link.startswith("/"):
+            # タイトル & URL を得た直後の処理を以下のように変更
+            # （既存の if link and link.startswith("/") ... の2分岐を置き換え）
+            
+            # URL 絶対化（先頭が / でなくても常に urljoin）
+            if link:
                 link = urljoin(url, link)
+            
+            # http(s) 必須 & 末尾ノイズ除去
             if not (link and link.startswith("http")):
                 continue
             link = link.rstrip("&")
@@ -401,3 +399,4 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
