@@ -30,10 +30,18 @@ def parse_date_range(text):
     if not text:
         return None, None
     t = str(text)
-    # 余計な文字（曜日・スペース）
+
+    # 曜日・空白など除去
     t = re.sub(r'[（）\(\)曜月火水木金土日・\s]', '', t)
-    # 区切りの正規化（全角/半角ハイフン・波線）
-    t = t.replace('－', '〜').replace('～', '〜').replace('-', '〜').replace('―','〜')
+
+    # 区切りの正規化（全角/半角/各種ダッシュ・波線）
+    # '−' = U+2212 MINUS SIGN を含めてすべて '〜' に統一
+    t = (t.replace('－', '〜')
+           .replace('～', '〜')
+           .replace('-',  '〜')
+           .replace('―', '〜')
+           .replace('−', '〜'))   # ★ 追加
+
     parts = t.split('〜')
 
     def _norm(p):
@@ -313,6 +321,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
 
