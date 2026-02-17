@@ -81,7 +81,7 @@ def fetch_kagaku(
     tables = soup.find_all("table")
     print(f"[kagaku] tables found = {len(tables)}")
 
-    # 候補テーブル（見出し語を含むもの）
+    # 見出し語を含むテーブルのみ候補化
     candidates = []
     for tb in tables:
         header_txt = tb.get_text(" ", strip=True)
@@ -91,7 +91,7 @@ def fetch_kagaku(
 
     synonyms = {
         "title": ["イベント名", "イベント", "イベントの名称", "名称", "題目"],
-        "year":  ["年"],  # ★ 追加：年列
+        "year":  ["年"],
         "date":  ["会期", "開催日", "日程", "期間"],
         "venue": ["場所", "会場", "開催地", "場所/会場"],
         "url":   ["URL", "リンク", "Link"],
@@ -127,24 +127,24 @@ def fetch_kagaku(
                 continue
             texts = [td.get_text(" ", strip=True) for td in tds]
 
-            # ---- タイトル & URL（タイトル列の <a> を必須に）----
+            # ---- タイトル列の <a href> を必須 ----
             a_title = None
             if header_idx.get("title") is not None and header_idx["title"] < len(tds):
                 a_title = tds[header_idx["title"]].find("a", href=True)
             if not a_title:
-                # タイトル列に a が無ければイベントとみなさない
-                continue
+                continue  # イベント以外を除外
+
             title = a_title.get_text(" ", strip=True)
             link  = a_title["href"]
 
-            # URL絶対化 & 末尾ノイズ除去
+            # URL絶対化 + http(s) 必須 + 末尾ノイズ除去
             if link and link.startswith("/"):
                 link = urljoin(url, link)
             if not (link and link.startswith("http")):
                 continue
             link = link.rstrip("&")
 
-            # ---- 年（任意）----
+            # ---- 年の取得（あれば補完に使う）----
             year_val = None
             if header_idx.get("year") is not None and header_idx["year"] < len(texts):
                 ytxt = texts[header_idx["year"]]
@@ -152,7 +152,7 @@ def fetch_kagaku(
                 if m:
                     year_val = m.group(1)
 
-            # ---- 会期（列インデックス or 厳しめフォールバック）----
+            # ---- 会期（列 or 厳しめフォールバック）----
             date_text = None
             if header_idx.get("date") is not None and header_idx["date"] < len(texts):
                 date_text = texts[header_idx["date"]]
@@ -164,14 +164,14 @@ def fetch_kagaku(
             if not date_text:
                 continue
 
-            # 年の補完（"2/16-2/18" 形式に year を前置）
+            # 年補完（年が列で取れていて date に年が無い場合）
             date_for_parse = date_text
             if year_val and ("年" not in date_text):
                 date_for_parse = f"{year_val}年{date_text}"
 
             start, end = parse_date_range(date_for_parse)
             if not (start or end):
-                continue  # ← 採用条件：会期が解釈できる
+                continue  # 採用条件：会期が解釈できる
 
             # ---- 会場 ----
             venue = None
@@ -179,6 +179,10 @@ def fetch_kagaku(
                 venue = texts[header_idx["venue"]]
             else:
                 venue = texts[-1] if texts else None
+
+            # タイトル最小長で軽くノイズ除外（任意）
+            if not title or len(title) < 5:
+                continue
 
             rows.append({
                 "source": "kagaku",
@@ -209,12 +213,12 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
             if not title or not dl:
                 continue
 
-            # dt/dd を辞書化（見出しに '開催' と '期間' を含む dd を会期に）
             date_text, venue, link = None, None, None
+
+            # 1) 通常パス：dt=開催期間 / dt=利用施設 / dt=URL
             for div in dl.select("div"):
-                dt_ = div.find("dt")
-                dd_ = div.find("dd")
-                if not dt_ or not dd_:
+                dt_ = div.find("dt"); dd_ = div.find("dd")
+                if not dt_ or not dd_: 
                     continue
                 key = dt_.get_text(strip=True)
                 val = dd_.get_text(" ", strip=True)
@@ -222,15 +226,23 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
                     date_text = val
                 elif ("利用" in key) and ("施設" in key):
                     venue = val
-                elif key.strip().upper() == "URL":
+                elif key and key.strip().upper() == "URL":
                     a2 = dd_.find("a", href=True)
                     if a2:
                         link = a2["href"]
 
-            # 会期必須
+            # 2) フォールバック：dl内のddから日付パターンで拾う
+            if not date_text:
+                for dd_ in dl.find_all("dd"):
+                    txt = dd_.get_text(" ", strip=True)
+                    if re.search(r"\d{4}年?\d{1,2}月?\d{1,2}日?", txt) or re.search(r"\d{1,2}/\d{1,2}", txt):
+                        date_text = txt
+                        break
+
             start, end = parse_date_range(date_text) if date_text else (None, None)
             if not (start or end):
                 continue
+
             if not link and a_t and a_t.get("href"):
                 link = a_t["href"]
 
@@ -245,7 +257,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
 
     while queue and pages_crawled < max_pages:
         u = queue.pop(0)
-        if u in seen_pages:
+        if u in seen_pages: 
             continue
         seen_pages.add(u)
 
@@ -266,7 +278,8 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
 
 # -------- C) 幕張メッセ（印刷用） --------
 def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
-    r = requests.get(url, timeout=30)
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MesseBot/1.0; +https://github.com/your/repo)"}
+    r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     _save_debug("makuhari", r.text)
 
@@ -287,27 +300,26 @@ def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
         if "会期" in dr:   # 見出し様行は除外
             continue
 
-        # 会期らしいかを厳しめに判定
-        if not (re.search(r"\d{1,2}/\d{1,2}", dr) or ("年" in dr and "月" in dr and "日" in dr)):
-            continue
-
         title = vals[1] if len(vals) > 1 else None
         venue = vals[2] if len(vals) > 2 else None
-        start, end = parse_date_range(dr)
+        start, end = parse_date_range(dr) if dr else (None, None)
+
+        # 文字列パターンではなくパース結果で採用判定
+        if not (title and (start or end)):
+            continue
 
         tail = " ".join(vals[3:]) if len(vals) > 3 else ""
         murl = re.search(r'(https?://[^\s]+)', tail)
         link = murl.group(1) if murl else None
 
-        if title and (start or end):
-            rows.append({
-                "source": "makuhari",
-                "title": title,
-                "start_date": start,
-                "end_date": end,
-                "venue": venue,
-                "url": link
-            })
+        rows.append({
+            "source": "makuhari",
+            "title": title,
+            "start_date": start,
+            "end_date": end,
+            "venue": venue,
+            "url": link
+        })
     print(f"[makuhari] parsed_rows = {len(rows)}")
     return pd.DataFrame(rows)
 
@@ -346,5 +358,6 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
