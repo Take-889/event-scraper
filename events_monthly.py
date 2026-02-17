@@ -23,23 +23,22 @@ def _save_debug(name: str, text: str):
 
 # -------- 共通: 日付パース（柔軟な和暦/日本語表記対応の簡易版） --------
 def parse_date_range(text):
-    """
-    '2026年02月18日（水）～2026年02月20日（金）' や
-    '2/18 水－2/20 金' 等から (YYYY-MM-DD, YYYY-MM-DD) を返す。
-    """
+    import re
+    from datetime import datetime
+    from dateutil import parser as dtparser
+
     if not text:
         return None, None
     t = str(text)
-    # ノイズ除去：曜日・全角スペース・余分な全角/半角チルダ・ダッシュ
+    # 余計な文字（曜日・スペース）
     t = re.sub(r'[（）\(\)曜月火水木金土日・\s]', '', t)
-    t = t.replace('－', '〜').replace('～', '〜')
+    # 区切りの正規化（全角/半角ハイフン・波線）
+    t = t.replace('－', '〜').replace('～', '〜').replace('-', '〜').replace('―','〜')
     parts = t.split('〜')
 
     def _norm(p):
-        # '2026年02月18日' or '2/18' など
         now_y = datetime.now().year
         p1 = p.replace('年','/').replace('月','/').replace('日','')
-        # 年省略に対応（年が無いとき default の年を埋める）
         try:
             dt = dtparser.parse(p1, default=datetime(now_y, 1, 1))
             return dt.strftime('%Y-%m-%d')
@@ -157,7 +156,7 @@ def fetch_kagaku(
 # 先頭の import 群の近くに入っていなければ追加
 from urllib.parse import urljoin
 
-def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=1):
+def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
     import requests, re
     from bs4 import BeautifulSoup
 
@@ -278,11 +277,20 @@ def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
 
 # -------- 統合・出力 --------
 def monthly_run(output_csv="events_agg.csv"):
-    df_k = fetch_kagaku();     print("kagaku:", len(df_k))
-    df_b = fetch_bigsight(max_pages=1);  print("bigsight:", len(df_b))
-    df_m = fetch_makuhari();   print("makuhari:", len(df_m))
+    df_k = fetch_kagaku();      print("kagaku:", len(df_k))
+    df_b = fetch_bigsight(max_pages=5);  print("bigsight:", len(df_b))  # ← ページめくり拡張（後述）
+    df_m = fetch_makuhari();    print("makuhari:", len(df_m))
 
     all_df = pd.concat([df_k, df_b, df_m], ignore_index=True)
+
+    # 文字列の軽い正規化（空白の連続を1つに）
+    import re
+    def _norm(s): 
+        return re.sub(r'\s+', ' ', s).strip() if isinstance(s, str) else s
+    for c in ["title", "venue", "url"]:
+        if c in all_df.columns:
+            all_df[c] = all_df[c].map(_norm)
+
     keep_cols = ["source","title","start_date","end_date","venue","url"]
     for col in keep_cols:
         if col not in all_df.columns:
@@ -290,10 +298,13 @@ def monthly_run(output_csv="events_agg.csv"):
     all_df = all_df[keep_cols].copy()
     all_df["last_seen_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    # 重複除去はタイトルだけで一度様子見（start_date 未取得でも落ちないように）
-    all_df = all_df.drop_duplicates(subset=["title"])
+    # ★重複除去を元に戻す（= タイトルだけで潰さない）
+    all_df = all_df.drop_duplicates(subset=["title", "start_date", "venue"])
 
-    # Excel互換のUTF-8 BOM付き
+    # 並び（開始日の昇順→タイトル）
+    all_df = all_df.sort_values(by=["start_date","title"], kind="stable")
+
+    # Excelで文字化けしないUTF-8（BOM付き）
     all_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"Saved: {output_csv} ({len(all_df)} rows)")
 
@@ -302,6 +313,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
 
