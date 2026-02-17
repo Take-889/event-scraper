@@ -55,28 +55,29 @@ def parse_date_range(text):
 # -------- A) 科学カレンダー（kagaku.com） --------
 # 例: 全学協会（society_all）×全地域
 def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"):
-    import requests
+    import requests, re
     from bs4 import BeautifulSoup
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
 
-    # ★デバッグ保存
+    r = requests.get(url, timeout=30); r.raise_for_status()
     _save_debug("kagaku", r.text)
 
     soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
+    print(f"[kagaku] table_found = {bool(table)}")  # ★
+
     rows = []
     if not table:
         return pd.DataFrame(rows)
 
-    import re
-    for tr in table.find_all("tr"):
+    trs = table.find_all("tr")
+    print(f"[kagaku] tr_count = {len(trs)}")  # ★
+    for tr in trs:
         tds = tr.find_all(['td','th'])
         if len(tds) < 3:
             continue
         texts = [td.get_text(strip=True) for td in tds]
-        header_like = any(k in "".join(texts) for k in ["イベント", "会期"])
-        if header_like and tr.find('th'):
+        # ヘッダ行スキップ（必要に応じて調整）
+        if tr.find('th'):
             continue
 
         title = texts[0]
@@ -86,12 +87,13 @@ def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_al
         dr = None
         for tx in texts:
             if re.search(r'\d{1,2}/\d{1,2}', tx) or ('年' in tx and '月' in tx):
-                dr = tx
-                break
+                dr = tx; break
+
         start, end = parse_date_range(dr or "")
         place = texts[-1] if texts else None
 
-        if title and (start or end):
+        # ★一時緩和
+        if title:
             rows.append({
                 "source": "kagaku",
                 "title": title,
@@ -100,55 +102,46 @@ def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_al
                 "venue": place,
                 "url": link
             })
+    print(f"[kagaku] parsed_rows = {len(rows)}")  # ★
     return pd.DataFrame(rows)
 
 # -------- B) 東京ビッグサイト（bigsight.jp） --------
+# 先頭の import 群の近くに入っていなければ追加
 from urllib.parse import urljoin
 
-def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
-    """
-    東京ビッグサイト 来場者向けイベント一覧（ページネーション対応版）
-    DOM構造（article.lyt-event-01 / h3.hdg-01 / dl.list-01）に準拠。
-    ページャは .list-pager-01 a[href] を辿る（相対→絶対URL）。
-    参照: _debug_bigsight_latest.html
-    """
+def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=1):
     import requests, re
     from bs4 import BeautifulSoup
 
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0; +https://github.com/your/repo)"
-    }
-
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0; +https://github.com/your/repo)"}
     events = []
     seen_pages = set()
     queue = [url]
+    pages_crawled = 0
 
-    def parse_cards(soup):
-        nonlocal events
+    def parse_cards(soup, page_idx):
         cards = soup.select("article.lyt-event-01")
-        for card in cards:
+        print(f"[bigsight] page{page_idx}: cards found = {len(cards)}")  # ★カード枚数ログ
+        for i, card in enumerate(cards, 1):
             a_t = card.select_one("h3.hdg-01 a[href]")
             title = a_t.get_text(strip=True) if a_t else None
             dl = card.select_one("div.content dl.list-01")
             if not title or not dl:
                 continue
 
-            # dt/dd を辞書化
             info = {}
             for div in dl.select("div"):
                 dt = div.find("dt"); dd = div.find("dd")
-                if not dt or not dd: 
+                if not dt or not dd:
                     continue
                 info[dt.get_text(strip=True)] = dd.get_text(" ", strip=True)
 
-            # 会期
-            date_text = info.get("開催期間")
+            # 会期（無くても一旦通す＝原因切り分け用）
+            date_text = info.get("開催期間") or ""
             start, end = parse_date_range(date_text) if date_text else (None, None)
-
-            # 会場
             venue = info.get("利用施設")
 
-            # 主催サイトURL（dt=URL の dd 内の a）
+            # URL
             link = None
             url_dt = dl.find("dt", string="URL")
             if url_dt:
@@ -157,21 +150,19 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
                     a2 = dd.find("a", href=True)
                     if a2:
                         link = a2["href"]
-            # タイトルの a も外部URLであることがある
             if not link and a_t and a_t.get("href"):
                 link = a_t["href"]
 
-            if title and (start or end):
-                events.append({
-                    "source": "bigsight",
-                    "title": title,
-                    "start_date": start,
-                    "end_date": end,
-                    "venue": venue,
-                    "url": link
-                })
+            # ★一時緩和：タイトルさえ取れたら入れる（後で元に戻します）
+            events.append({
+                "source": "bigsight",
+                "title": title,
+                "start_date": start,
+                "end_date": end,
+                "venue": venue,
+                "url": link
+            })
 
-    pages_crawled = 0
     while queue and pages_crawled < max_pages:
         u = queue.pop(0)
         if u in seen_pages:
@@ -180,41 +171,35 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
 
         r = requests.get(u, headers=HEADERS, timeout=30)
         r.raise_for_status()
-
-        # デバッグ保存（どのページを取ったかが分かるよう連番を付与）
         pages_crawled += 1
-        _save_debug(f"bigsight_p{pages_crawled}", r.text)  # [1](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_bigsight_latest.html)
+        _save_debug(f"bigsight_p{pages_crawled}", r.text)
 
         soup = BeautifulSoup(r.text, "html.parser")
+        parse_cards(soup, pages_crawled)
 
-        # 1) カード抽出
-        parse_cards(soup)  # 実DOMのカード構造に基づく抽出（article.lyt-event-01 等）[1](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_bigsight_latest.html)
+        # max_pages>1にしたときに次ページも追う（今回は1ページで検証）
+        if max_pages > 1:
+            for a in soup.select(".list-pager-01 a[href]"):
+                queue.append(urljoin(u, a["href"]))
 
-        # 2) ページャから次URLを収集
-        for a in soup.select(".list-pager-01 a[href]"):
-            next_u = urljoin(u, a["href"])
-            # /visitor/event/（初期）と /visitor/event/search.php?page=N が混在するため絶対化が安全[1](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_bigsight_latest.html)
-            if next_u not in seen_pages:
-                queue.append(next_u)
-
-    # DataFrame で返却
+    print(f"[bigsight] total events parsed = {len(events)}")  # ★総件数ログ
     return pd.DataFrame(events)
 
 # -------- C) 幕張メッセ（印刷用） --------
 def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
     import requests
-    from bs4 import BeautifulSoup
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    from bs4 import BeautifulSoup, SoupStrainer
 
-    # ★デバッグ保存
+    r = requests.get(url, timeout=30); r.raise_for_status()
     _save_debug("makuhari", r.text)
 
     soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
+    print(f"[makuhari] table_found = {bool(table)}")  # ★有無ログ
     rows = []
     if not table:
         return pd.DataFrame(rows)
+
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2:
@@ -230,25 +215,25 @@ def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
         murl = re.search(r'(https?://[^\s]+)', tail)
         link = murl.group(1) if murl else None
 
-        if title and (start or end):
+        # ★一時緩和：タイトルさえ取れたら入れる（後で元に戻します）
+        if title:
             rows.append({
-                'source': 'makuhari',
-                'title': title,
-                'start_date': start,
-                'end_date': end,
-                'venue': venue,
-                'url': link
+                "source": "makuhari",
+                "title": title,
+                "start_date": start,
+                "end_date": end,
+                "venue": venue,
+                "url": link
             })
+    print(f"[makuhari] parsed_rows = {len(rows)}")  # ★件数ログ
     return pd.DataFrame(rows)
 
 # -------- 統合・出力 --------
 def monthly_run(output_csv="events_agg.csv"):
-    # ▼ まず各サイトを取得し、件数をログ出力
-    df_k = fetch_kagaku();  print("kagaku:", len(df_k))
-    df_b = fetch_bigsight(); print("bigsight:", len(df_b))
-    df_m = fetch_makuhari(); print("makuhari:", len(df_m))
+    df_k = fetch_kagaku();     print("kagaku:", len(df_k))
+    df_b = fetch_bigsight(max_pages=1);  print("bigsight:", len(df_b))  # ← 呼び先を確認！
+    df_m = fetch_makuhari();   print("makuhari:", len(df_m))
 
-    # ▼ 集約・重複排除・出力
     all_df = pd.concat([df_k, df_b, df_m], ignore_index=True)
     keep_cols = ["source","title","start_date","end_date","venue","url"]
     for col in keep_cols:
@@ -257,10 +242,9 @@ def monthly_run(output_csv="events_agg.csv"):
     all_df = all_df[keep_cols].copy()
     all_df["last_seen_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    # タイトル＋開始日で重複除去
-    all_df = all_df.drop_duplicates(subset=["title", "start_date"])
+    # ★一時的に重複除去を弱める（start_dateがNoneで全落ちするのを防ぐ）
+    all_df = all_df.drop_duplicates(subset=["title"])
 
-    # Excelで文字化けしないUTF-8 BOM付き
     all_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"Saved: {output_csv} ({len(all_df)} rows)")
 
@@ -269,6 +253,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
 
