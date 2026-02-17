@@ -69,13 +69,14 @@ def fetch_kagaku(
     - 採用条件：タイトル必須 + 会期（start or end）を解釈できる行のみ
     - URLは相対→絶対へ補正し、末尾の余計な'&'を除去
     """
+    import re
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (compatible; KagakuScraper/1.0; +https://github.com/your/repo)"
     }
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
 
-    # 文字コードを堅牢化
+    # 文字コードを堅牢化（EUC-JP/Shift_JIS/UTF-8）
     enc = r.apparent_encoding or r.encoding or "EUC-JP"
     try:
         r.encoding = enc
@@ -129,8 +130,9 @@ def fetch_kagaku(
             # 見出し推定（th 行 or 最上段）
             if header_idx is None:
                 header_idx, header_seen = map_headers(tr)
-                # 見出しが th でなくても最初に推定して続行
-                continue if header_seen else None
+                # ←★ 修正ポイント：ヘッダ行（thあり）のときだけスキップ
+                if header_seen:
+                    continue
 
             tds = tr.find_all("td")
             if len(tds) < 2:
@@ -179,7 +181,7 @@ def fetch_kagaku(
             # if a0 and a0.has_attr("title"):
             #     organizer = a0["title"].replace("主催：", "").strip()
 
-            # 採用条件：タイトル必須 + 会期が解釈できる（start か end のいずれか）
+            # 採用条件：タイトル必須 + 会期（start or end）を解釈できる
             start, end = parse_date_range(date_text) if date_text else (None, None)
             if not title or not (start or end):
                 continue
@@ -196,7 +198,6 @@ def fetch_kagaku(
 
     print(f"[kagaku] parsed_rows = {len(rows)}")
     return pd.DataFrame(rows)
-
 
 # -------- B) 東京ビッグサイト（bigsight.jp） --------
 def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/", max_pages=5):
@@ -352,3 +353,4 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
