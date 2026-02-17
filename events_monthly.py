@@ -54,55 +54,103 @@ def parse_date_range(text):
 
 # -------- A) 科学カレンダー（kagaku.com） --------
 # 例: 全学協会（society_all）×全地域
-def fetch_kagaku(url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"):
+def fetch_kagaku(
+    url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
+):
     import requests, re
     from bs4 import BeautifulSoup
 
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    _save_debug("kagaku", r.text)
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (compatible; KagakuScraper/1.0; +https://github.com/your/repo)"
+    }
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    print(f"[kagaku] table_found = {bool(table)}")  # ★
+    # ★ 文字コード対策：apparent_encoding を使い、明示的に decode
+    # （kagaku.com はページにより Shift_JIS/EUC-JP などの可能性があるため）
+    enc = r.apparent_encoding or r.encoding or "utf-8"
+    r.encoding = enc
+    html = r.text
+
+    _save_debug("kagaku", html)
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # テーブル候補を広めに拾いつつ、見出し（会期/イベント）を含むものを優先
+    tables = soup.find_all("table")
+    print(f"[kagaku] tables found = {len(tables)}")
+
+    target_tables = []
+    for idx, tb in enumerate(tables, 1):
+        txt = tb.get_text(" ", strip=True)
+        if any(k in txt for k in ["会期", "イベント", "場所", "主催", "イベント名"]):
+            target_tables.append(tb)
+    print(f"[kagaku] candidate tables = {len(target_tables)}")
 
     rows = []
-    if not table:
-        return pd.DataFrame(rows)
+    def try_parse_table(tb, t_index):
+        nonlocal rows
+        trs = tb.find_all("tr")
+        print(f"[kagaku] t{t_index}: tr_count = {len(trs)}")
 
-    trs = table.find_all("tr")
-    print(f"[kagaku] tr_count = {len(trs)}")  # ★
-    for tr in trs:
-        tds = tr.find_all(['td','th'])
-        if len(tds) < 3:
-            continue
-        texts = [td.get_text(strip=True) for td in tds]
-        # ヘッダ行スキップ（必要に応じて調整）
-        if tr.find('th'):
-            continue
+        for r_idx, tr in enumerate(trs, 1):
+            tds = tr.find_all(["td", "th"])
+            if len(tds) < 2:
+                continue
 
-        title = texts[0]
-        a = tr.find("a", href=True)
-        link = a["href"] if a else None
+            # 見出し行（th多め）を除外
+            if tr.find("th"):
+                continue
 
-        dr = None
-        for tx in texts:
-            if re.search(r'\d{1,2}/\d{1,2}', tx) or ('年' in tx and '月' in tx):
-                dr = tx; break
+            texts = [td.get_text(" ", strip=True) for td in tds]
+            line = " | ".join(texts)
+            # ログ（必要に応じてコメントアウト可）
+            # print(f"[kagaku] t{t_index} r{r_idx}: {line}")
 
-        start, end = parse_date_range(dr or "")
-        place = texts[-1] if texts else None
+            # 想定： [イベント名, （任意列）, 会期, （任意列）, 場所 or 主催] など揺れあり
+            # 1) タイトル：最初のセル（リンク優先）
+            a = tr.find("a", href=True)
+            title = None
+            link = None
+            if a:
+                t_candidate = a.get_text(strip=True)
+                if t_candidate:
+                    title = t_candidate
+                link = a["href"]
 
-        # ★一時緩和
-        if title:
-            rows.append({
-                "source": "kagaku",
-                "title": title,
-                "start_date": start,
-                "end_date": end,
-                "venue": place,
-                "url": link
-            })
-    print(f"[kagaku] parsed_rows = {len(rows)}")  # ★
+            # タイトルがまだ空なら先頭セル
+            if not title:
+                title = texts[0] if texts else None
+
+            # 2) 会期らしきセル：/ または "年/月/日" を含む最初のセル
+            dr = None
+            for tx in texts:
+                if re.search(r"\d{1,2}/\d{1,2}", tx) or ("年" in tx and "月" in tx):
+                    dr = tx; break
+
+            # 3) 場所・主催っぽいセル：最後のセルを一旦採用
+            venue_or_org = texts[-1] if texts else None
+
+            start, end = parse_date_range(dr or "")
+            if title:
+                rows.append({
+                    "source": "kagaku",
+                    "title": title,
+                    "start_date": start,
+                    "end_date": end,
+                    "venue": venue_or_org,
+                    "url": link
+                })
+
+    if target_tables:
+        for i, tb in enumerate(target_tables, 1):
+            try_parse_table(tb, i)
+    else:
+        # テキストの薄い構成の場合、最初の1-2テーブルも一応試す
+        for i, tb in enumerate(tables[:2], 1):
+            try_parse_table(tb, i)
+
+    print(f"[kagaku] parsed_rows = {len(rows)}")
     return pd.DataFrame(rows)
 
 # -------- B) 東京ビッグサイト（bigsight.jp） --------
@@ -231,7 +279,7 @@ def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
 # -------- 統合・出力 --------
 def monthly_run(output_csv="events_agg.csv"):
     df_k = fetch_kagaku();     print("kagaku:", len(df_k))
-    df_b = fetch_bigsight(max_pages=1);  print("bigsight:", len(df_b))  # ← 呼び先を確認！
+    df_b = fetch_bigsight(max_pages=1);  print("bigsight:", len(df_b))
     df_m = fetch_makuhari();   print("makuhari:", len(df_m))
 
     all_df = pd.concat([df_k, df_b, df_m], ignore_index=True)
@@ -242,9 +290,10 @@ def monthly_run(output_csv="events_agg.csv"):
     all_df = all_df[keep_cols].copy()
     all_df["last_seen_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    # ★一時的に重複除去を弱める（start_dateがNoneで全落ちするのを防ぐ）
+    # 重複除去はタイトルだけで一度様子見（start_date 未取得でも落ちないように）
     all_df = all_df.drop_duplicates(subset=["title"])
 
+    # Excel互換のUTF-8 BOM付き
     all_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"Saved: {output_csv} ({len(all_df)} rows)")
 
@@ -253,6 +302,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
 
