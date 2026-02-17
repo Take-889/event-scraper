@@ -1,5 +1,6 @@
-# events_monthly.py  (rewritten & hardened)
+# events_monthly.py
 # -*- coding: utf-8 -*-
+
 import os
 import re
 import logging
@@ -11,11 +12,13 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
+
 try:
     # urllib3 v1/v2 両対応
     from urllib3.util.retry import Retry
 except Exception:
     Retry = None
+
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -29,21 +32,27 @@ DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
 
 
 # ---------------- Utilities ----------------
-def _save_debug(name: str, text: str):
-    """Save HTML for debugging (optional via DEBUG_HTML=1)."""
+def _save_debug(name: str, text: str) -> None:
+    """
+    Save HTML for debugging (optional via DEBUG_HTML=1).
+    """
     if not DEBUG_HTML:
         return
     fn = f"_debug_{name}.html"
     with open(fn, "w", encoding="utf-8") as f:
         f.write(text)
-    logger.debug(f"Saved debug HTML: {fn}")
+    logger.debug("Saved debug HTML: %s", fn)
 
 
 def make_session() -> requests.Session:
+    """
+    Make a requests Session with retries and default headers.
+    """
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.0; +https://example.org)"
+        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.1; +https://example.org)"
     })
+    # リトライは利用可能な場合のみ設定
     if Retry is not None:
         retries = Retry(
             total=3,
@@ -54,15 +63,23 @@ def make_session() -> requests.Session:
             allowed_methods=frozenset(["GET", "HEAD"])
         )
         adapter = HTTPAdapter(max_retries=retries)
-        s.mount("http://", adapter)
-        s.mount("https://", adapter)
+    else:
+        adapter = HTTPAdapter()
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
     return s
 
 
 def get_html(url: str, session: requests.Session, timeout: int = 30) -> str:
+    """
+    Fetch HTML with robust encoding decision:
+    1) charset from Content-Type
+    2) apparent_encoding
+    3) response.encoding
+    4) utf-8 (fallback)
+    """
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
-    # Content-Type の charset を優先 → 無ければ apparent → encoding → utf-8
     ctype = r.headers.get("Content-Type", "")
     m = re.search(r"charset=([^\s;]+)", ctype, flags=re.I)
     enc = (m.group(1).strip() if m else None) or r.apparent_encoding or r.encoding or "utf-8"
@@ -86,7 +103,7 @@ def parse_date_range(text: str):
     t = re.sub(r'（.*?）', '', t)
     t = re.sub(r'\(.*?\)', '', t)
 
-    # 曜日・記号・空白の正規化
+    # 曜日・空白の削除
     t = re.sub(r'(月|火|水|木|金|土|日)曜?', '', t)
     t = re.sub(r'\s+', '', t)
 
@@ -123,7 +140,7 @@ def parse_date_range(text: str):
 
 # ---------------- Site A: Kagaku.com ----------------
 def fetch_kagaku(
-    url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
+    url: str = "https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
 ) -> pd.DataFrame:
     """
     科学カレンダーから イベント名/会期/会場/URL を抽出
@@ -184,7 +201,7 @@ def fetch_kagaku(
 
 
 # ---------------- Site B: Tokyo Big Sight ----------------
-def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/") -> pd.DataFrame:
+def fetch_bigsight(url: str = "https://www.bigsight.jp/visitor/event/") -> pd.DataFrame:
     """
     東京ビッグサイトのイベント一覧（複数ページ）から抽出
     """
@@ -197,15 +214,16 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/") -> pd.DataFrame
         try:
             html = get_html(u, session)
         except requests.HTTPError as e:
-            logger.warning(f"bigsight HTTP error on page {page}: {e}")
+            logger.warning("bigsight HTTP error on page %s: %s", page, e)
             break
 
         _save_debug(f"bigsight_p{page}", html)
         soup = BeautifulSoup(html, "html.parser")
 
+        # 構造が変わる場合を考慮し、複数候補のセレクタを定義
         cards = soup.select("div.l-event__item, li.l-event__item")
         if not cards:
-            # 構造変化 or 末尾
+            # 末尾もしくは構造変化
             if page == 1:
                 logger.warning("bigsight: no cards found on first page")
             break
@@ -226,7 +244,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/") -> pd.DataFrame
                 m = re.search(r'(\d{1,2}/\d{1,2}.*?〜.*?\d{1,2}/\d{1,2})', date_text)
             start, end = parse_date_range(m.group(1)) if m else (None, None)
 
-            # URL：まず内部の詳細ページ優先、なければ最初の a[href]
+            # URL：内部の詳細ページ優先、なければ最初の a[href]
             detail = c.find("a", href=True)
             link = urljoin(url, detail["href"]) if detail else None
 
@@ -246,7 +264,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/") -> pd.DataFrame
 
 
 # ---------------- Site C: Makuhari Messe (print) ----------------
-def fetch_makuhari(url="https://www.m-messe.co.jp/event/print") -> pd.DataFrame:
+def fetch_makuhari(url: str = "https://www.m-messe.co.jp/event/print") -> pd.DataFrame:
     """
     幕張メッセ印刷用ページ（表）から抽出
     """
@@ -303,16 +321,17 @@ def collect_all() -> pd.DataFrame:
             df = fetcher()
             if df is not None and not df.empty:
                 dfs.append(df)
-                logger.info(f"{fetcher.__name__}: {len(df)} rows")
+                logger.info("%s: %d rows", fetcher.__name__, len(df))
             else:
-                logger.warning(f"{fetcher.__name__}: empty")
+                logger.warning("%s: empty", fetcher.__name__)
         except Exception as e:
-            logger.exception(f"{fetcher.__name__} failed: {e}")
+            logger.exception("%s failed: %s", fetcher.__name__, e)
 
     if not dfs:
         return pd.DataFrame(columns=["source", "title", "start_date", "end_date", "venue", "url"])
 
     out = pd.concat(dfs, ignore_index=True)
+
     # 列そろえ
     keep_cols = ["source", "title", "start_date", "end_date", "venue", "url"]
     for col in keep_cols:
@@ -328,13 +347,11 @@ def collect_all() -> pd.DataFrame:
     return out
 
 
-def monthly_run(output_csv="events_agg.csv"):
+def monthly_run(output_csv: str = "events_agg.csv") -> None:
     df = collect_all()
     df.to_csv(output_csv, index=False, encoding="utf-8")
-    logger.info(f"Saved: {output_csv} ({len(df)} rows)")
+    logger.info("Saved: %s (%d rows)", output_csv, len(df))
 
 
 if __name__ == "__main__":
     monthly_run()
-``
-
