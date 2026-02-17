@@ -1,160 +1,290 @@
-# -------- 共通: 日付パース --------
-def parse_date_range(text):
+# events_monthly.py  (rewritten & hardened)
+# -*- coding: utf-8 -*-
+import os
+import re
+import logging
+from datetime import datetime
+from urllib.parse import urljoin
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dtparser
+from requests.adapters import HTTPAdapter
+try:
+    # urllib3 v1/v2 両対応
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None
+
+# ---------------- Logging ----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+)
+logger = logging.getLogger("events")
+
+DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
+
+
+# ---------------- Utilities ----------------
+def _save_debug(name: str, text: str):
+    """Save HTML for debugging (optional via DEBUG_HTML=1)."""
+    if not DEBUG_HTML:
+        return
+    fn = f"_debug_{name}.html"
+    with open(fn, "w", encoding="utf-8") as f:
+        f.write(text)
+    logger.debug(f"Saved debug HTML: {fn}")
+
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.0; +https://example.org)"
+    })
+    if Retry is not None:
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.7,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "HEAD"])
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+    return s
+
+
+def get_html(url: str, session: requests.Session, timeout: int = 30) -> str:
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    # Content-Type の charset を優先 → 無ければ apparent → encoding → utf-8
+    ctype = r.headers.get("Content-Type", "")
+    m = re.search(r"charset=([^\s;]+)", ctype, flags=re.I)
+    enc = (m.group(1).strip() if m else None) or r.apparent_encoding or r.encoding or "utf-8"
+    r.encoding = enc
+    return r.text
+
+
+# ---------------- Date parsing ----------------
+def parse_date_range(text: str):
+    """
+    '2026年02月18日（水）～2026年02月20日（金）'
+    '2/18 水-2/20 金'
+    -> (YYYY-MM-DD, YYYY-MM-DD)
+    """
     if not text:
         return None, None
+
     t = str(text)
-    t = re.sub(r'[（(].*?[）)]', '', t)           # 括弧内削除
-    t = re.sub(r'\s+', '', t)                    # 空白削除
+
+    # 括弧内削除（全角/半角）
+    t = re.sub(r'（.*?）', '', t)
+    t = re.sub(r'\(.*?\)', '', t)
+
+    # 曜日・記号・空白の正規化
+    t = re.sub(r'(月|火|水|木|金|土|日)曜?', '', t)
+    t = re.sub(r'\s+', '', t)
+
+    # 区切り統一（各種ダッシュ/チルダを 〜 に寄せる）
     for ch in ['〜', '～', '-', '−', '—', '–', '－', '―']:
-        t = t.replace(ch, '〜')                  # 区切り統一
-    t = t.replace('年', '/').replace('月', '/').replace('日', '')  # 年/月/日 → スラッシュ
-    t = re.sub(r'[月火水木金土日曜]', '', t)     # 曜日文字を最後に除去
+        t = t.replace(ch, '〜')
+
+    # 和文年月日をスラッシュ化（限定的に）
+    t = t.replace('年', '/').replace('月', '/').replace('日', '')
 
     parts = t.split('〜')
+    now_y = datetime.now().year
 
-    def _norm(p):
-        now_y = datetime.now().year
+    def _norm(p: str, default_year: int | None = None):
+        if not p:
+            return None
         try:
-            dt = dtparser.parse(p, default=datetime(now_y, 1, 1))
+            default = datetime(default_year or now_y, 1, 1)
+            dt = dtparser.parse(p, default=default)
             return dt.strftime('%Y-%m-%d')
         except Exception:
             return None
 
     if len(parts) == 2:
-        return _norm(parts[0]), _norm(parts[1])
+        left, right = parts
+        s = _norm(left)
+        year_for_right = int(s.split('-')[0]) if s else now_y
+        e = _norm(right, default_year=year_for_right)
+        return s, e
     else:
         d = _norm(t)
         return d, d
 
 
-# -------- A) 科学カレンダー（kagaku.com） --------
+# ---------------- Site A: Kagaku.com ----------------
 def fetch_kagaku(
     url="https://www.kagaku.com/calendar.php?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
-):
-    import re
-    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KagakuScraper/1.0; +https://github.com/your/repo)"}
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-
-    enc = r.apparent_encoding or r.encoding or "EUC-JP"
-    try:
-        r.encoding = enc
-        html = r.text
-    except Exception:
-        r.encoding = "utf-8"
-        html = r.text
-
+) -> pd.DataFrame:
+    """
+    科学カレンダーから イベント名/会期/会場/URL を抽出
+    """
+    session = make_session()
+    html = get_html(url, session)
     _save_debug("kagaku", html)
     soup = BeautifulSoup(html, "html.parser")
 
-    tables = soup.find_all("table")
-    print(f"[kagaku] tables found = {len(tables)}")
-
-    candidates = []
-    for tb in tables:
-        header_txt = tb.get_text(" ", strip=True)
-        if any(k in header_txt for k in ["イベント", "イベント名", "イベントの名称", "会期"]):
-            candidates.append(tb)
-    print(f"[kagaku] candidate tables = {len(candidates)}")
-
-    synonyms = {
-        "title": ["イベント名", "イベント", "イベントの名称", "名称", "題目"],
-        "year":  ["年"],
-        "date":  ["会期", "開催日", "日程", "期間"],
-        "venue": ["場所", "会場", "開催地", "場所/会場"],
-        "url":   ["URL", "リンク", "Link"],
-    }
-
-    def map_headers(tr):
-        ths = [th.get_text(" ", strip=True) for th in tr.find_all("th")]
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        cells = ths if ths else tds
-        idx = {"title": None, "year": None, "date": None, "venue": None, "url": None}
-        for i, c in enumerate(cells):
-            for key, words in synonyms.items():
-                if any(w in c for w in words) and idx[key] is None:
-                    idx[key] = i
-        return idx, bool(ths)
-
     rows = []
-    for ti, tb in enumerate(candidates, 1):
-        trs = tb.find_all("tr")
-        print(f"[kagaku] t{ti}: tr_count = {len(trs)}")
-        header_idx = None
-        header_seen = False
+    tables = soup.find_all("table")
+    for tb in tables:
+        # 表のどこかにキーワードが含まれていれば候補に
+        whole_txt = tb.get_text(" ", strip=True)
+        if not any(k in whole_txt for k in ["イベント", "イベント名", "イベントの名称", "会期"]):
+            continue
 
-        for ri, tr in enumerate(trs, 1):
-            # 見出し推定（th 行 or 最上段）
-            if header_idx is None:
-                header_idx, header_seen = map_headers(tr)
-                if header_seen:
-                    continue
-
-            tds = tr.find_all("td")
+        for tr in tb.find_all("tr"):
+            tds = tr.find_all(["td", "th"])
             if len(tds) < 2:
                 continue
+
+            # 見出し行スキップ
+            joined = " ".join(td.get_text(" ", strip=True) for td in tds)
+            if any(k in joined for k in ["イベント", "会期"]) and tr.find("th"):
+                continue
+
             texts = [td.get_text(" ", strip=True) for td in tds]
+            title = texts[0] if texts else None
 
-            # ---- タイトル & URL（a[href] を必須に）----
-            a_title = None
-            if header_idx.get("title") is not None and header_idx["title"] < len(tds):
-                a_title = tds[header_idx["title"]].find("a", href=True)
-            a_any = a_title or tr.find("a", href=True)
-            if not a_any:
-                continue
+            # URL（行内の最初のリンクを採用）
+            a = tr.find("a", href=True)
+            link = urljoin(url, a["href"]) if a and a.get("href") else None
+            if link and not link.startswith(("http://", "https://")):
+                link = None
 
-            title = a_any.get_text(" ", strip=True)
-            link  = a_any.get("href")
-
-            # URL 絶対化（相対/ルート相対どちらでも）
-            if link:
-                link = urljoin(url, link)
-            # http(s) 必須 & 末尾ノイズ除去
-            if not (link and link.startswith("http")):
-                continue
-            link = link.rstrip("&")
-
-            # ---- 年（任意：補完に使用）----
-            year_val = None
-            if header_idx.get("year") is not None and header_idx["year"] < len(texts):
-                m = re.search(r"\b(20\d{2}|19\d{2})\b", texts[header_idx["year"]])
-                if m:
-                    year_val = m.group(1)
-
-            # ---- 会期（列インデックス or 厳しめフォールバック）----
+            # 会期候補
             date_text = None
-            if header_idx.get("date") is not None and header_idx["date"] < len(texts):
-                date_text = texts[header_idx["date"]]
-            else:
-                for tx in texts:
-                    if re.search(r"\d{1,2}/\d{1,2}", tx) or (("年" in tx) and ("月" in tx) and ("日" in tx)):
-                        date_text = tx
-                        break
-            if not date_text:
-                continue
+            for tx in texts:
+                if re.search(r'\d{1,2}/\d{1,2}', tx) or ('年' in tx and '月' in tx):
+                    date_text = tx
+                    break
 
-            # 年が分かっていて date_text に年が無ければ補完
-            date_for_parse = date_text
-            if year_val and ("年" not in date_text):
-                date_for_parse = f"{year_val}年{date_text}"
+            start, end = parse_date_range(date_text or "")
+            venue = texts[-1] if texts else None
 
-            start, end = parse_date_range(date_for_parse)
-            if not (start or end):
-                continue  # 採用条件：会期が解釈できる
+            if title and (start or end):
+                rows.append({
+                    "source": "kagaku",
+                    "title": title,
+                    "start_date": start,
+                    "end_date": end,
+                    "venue": venue,
+                    "url": link
+                })
 
-            # ---- 会場 ----
-            venue = None
-            if header_idx.get("venue") is not None and header_idx["venue"] < len(texts):
-                venue = texts[header_idx["venue"]]
-            else:
-                venue = texts[-1] if texts else None
+    return pd.DataFrame(rows)
 
-            # タイトル最小長で軽くノイズ除外（任意）
-            if not title or len(title) < 5:
-                continue
 
+# ---------------- Site B: Tokyo Big Sight ----------------
+def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/") -> pd.DataFrame:
+    """
+    東京ビッグサイトのイベント一覧（複数ページ）から抽出
+    """
+    session = make_session()
+    events = []
+    page = 1
+
+    while True:
+        u = url if page == 1 else f"{url}?page={page}"
+        try:
+            html = get_html(u, session)
+        except requests.HTTPError as e:
+            logger.warning(f"bigsight HTTP error on page {page}: {e}")
+            break
+
+        _save_debug(f"bigsight_p{page}", html)
+        soup = BeautifulSoup(html, "html.parser")
+
+        cards = soup.select("div.l-event__item, li.l-event__item")
+        if not cards:
+            # 構造変化 or 末尾
+            if page == 1:
+                logger.warning("bigsight: no cards found on first page")
+            break
+
+        for c in cards:
+            # タイトル
+            ttl_el = c.select_one(".l-event__ttl, h3, .title, .event-title")
+            title = ttl_el.get_text(" ", strip=True) if ttl_el else None
+
+            # 日付要素（複数候補）
+            date_el = c.select_one(".l-event__date, .date, .event-date")
+            date_text = date_el.get_text(" ", strip=True) if date_el else c.get_text(" ", strip=True)
+
+            # 代表的な日付パターンを抜き出してパース
+            m = re.search(r'(\d{4}年?\d{1,2}月?\d{1,2}日?.*?〜?.*?\d{1,2}月?\d{1,2}日?)', date_text)
+            if not m:
+                # 年が省略されるケース用フォールバック（例：2/18〜2/20）
+                m = re.search(r'(\d{1,2}/\d{1,2}.*?〜.*?\d{1,2}/\d{1,2})', date_text)
+            start, end = parse_date_range(m.group(1)) if m else (None, None)
+
+            # URL：まず内部の詳細ページ優先、なければ最初の a[href]
+            detail = c.find("a", href=True)
+            link = urljoin(url, detail["href"]) if detail else None
+
+            if title and (start or end):
+                events.append({
+                    "source": "bigsight",
+                    "title": title,
+                    "start_date": start,
+                    "end_date": end,
+                    "venue": None,
+                    "url": link
+                })
+
+        page += 1
+
+    return pd.DataFrame(events)
+
+
+# ---------------- Site C: Makuhari Messe (print) ----------------
+def fetch_makuhari(url="https://www.m-messe.co.jp/event/print") -> pd.DataFrame:
+    """
+    幕張メッセ印刷用ページ（表）から抽出
+    """
+    session = make_session()
+    html = get_html(url, session)
+    _save_debug("makuhari", html)
+    soup = BeautifulSoup(html, "html.parser")
+
+    rows = []
+    table = soup.find("table")
+    if not table:
+        return pd.DataFrame(rows)
+
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+
+        vals = [td.get_text(" ", strip=True) for td in tds]
+        # 想定：0=会期、1=イベント名、2=主催/会場など…
+        date_text = vals[0]
+        title = vals[1] if len(vals) > 1 else None
+        venue = vals[2] if len(vals) > 2 else None
+
+        # aタグ or テキスト中URL を拾う
+        a = tr.find("a", href=True)
+        link = None
+        if a and a.get("href"):
+            link = urljoin(url, a["href"])
+        if not link:
+            tail = " ".join(vals[3:]) if len(vals) > 3 else ""
+            murl = re.search(r'(https?://[^\s]+)', tail)
+            link = murl.group(1) if murl else None
+
+        start, end = parse_date_range(date_text)
+        if title and (start or end):
             rows.append({
-                "source": "kagaku",
+                "source": "makuhari",
                 "title": title,
                 "start_date": start,
                 "end_date": end,
@@ -162,5 +292,49 @@ def fetch_kagaku(
                 "url": link
             })
 
-    print(f"[kagaku] parsed_rows = {len(rows)}")
     return pd.DataFrame(rows)
+
+
+# ---------------- Aggregation & Output ----------------
+def collect_all() -> pd.DataFrame:
+    dfs = []
+    for fetcher in (fetch_kagaku, fetch_bigsight, fetch_makuhari):
+        try:
+            df = fetcher()
+            if df is not None and not df.empty:
+                dfs.append(df)
+                logger.info(f"{fetcher.__name__}: {len(df)} rows")
+            else:
+                logger.warning(f"{fetcher.__name__}: empty")
+        except Exception as e:
+            logger.exception(f"{fetcher.__name__} failed: {e}")
+
+    if not dfs:
+        return pd.DataFrame(columns=["source", "title", "start_date", "end_date", "venue", "url"])
+
+    out = pd.concat(dfs, ignore_index=True)
+    # 列そろえ
+    keep_cols = ["source", "title", "start_date", "end_date", "venue", "url"]
+    for col in keep_cols:
+        if col not in out.columns:
+            out[col] = None
+    out = out[keep_cols].copy()
+
+    # 併合日
+    out["last_seen_at"] = datetime.now().strftime("%Y-%m-%d")
+
+    # 重複除去：source + title + start_date + url をキーに
+    out = out.drop_duplicates(subset=["source", "title", "start_date", "url"])
+    return out
+
+
+def monthly_run(output_csv="events_agg.csv"):
+    df = collect_all()
+    df.to_csv(output_csv, index=False, encoding="utf-8")
+    logger.info(f"Saved: {output_csv} ({len(df)} rows)")
+
+
+if __name__ == "__main__":
+    monthly_run()
+``
+
