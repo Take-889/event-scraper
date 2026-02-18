@@ -1,0 +1,39 @@
+name: Build events
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'  # 毎週月曜 00:00 UTC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -V
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip freeze
+
+      - name: Run script
+        env:
+          LOG_LEVEL: INFO
+          DEBUG_HTML: '1'   # 必要に応じて '1'
+        run: |
+          python events_monthly.py
+
+      - name: Upload artifacts (debug HTML / CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: |
+            events_agg.csv
+            _debug_*.html
