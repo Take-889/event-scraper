@@ -14,7 +14,7 @@ from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
 
 try:
-    # urllib3 v1/v2 両対応（無ければフォールバック）
+    # urllib3 v1/v2 両対応
     from urllib3.util.retry import Retry
 except Exception:
     Retry = None
@@ -46,7 +46,7 @@ def make_session():
     """Make a requests Session with retries and default headers."""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.4; +https://example.org)",
+        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.5; +https://example.org)",
         "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
     })
     if Retry is not None:
@@ -87,7 +87,7 @@ def get_html(url, session, timeout=30, headers=None):
 def parse_date_range(text):
     """
     '2026年02月18日（水）～2026年02月20日（金）'
-    '2/18 水-2/20 金' など -> (YYYY-MM-DD, YYYY-MM-DD)
+    '2/18 水-2/19 木' など -> (YYYY-MM-DD, YYYY-MM-DD)
     """
     if not text:
         return None, None
@@ -137,9 +137,9 @@ def parse_date_range(text):
 def fetch_kagaku():
     """
     科学カレンダー:
-    - まず calendar.php を叩いて検索条件をセッションに反映
-    - 同じ Session で calendartable.php を取得してテーブルをパース
-    - 0件なら最終フォールバックとして calendar.php 自体から抽出
+    - calendar.php の検索結果をそのままテーブルから抽出
+    - 列マッピング: 1列目=選択, 2列目=イベント名, 3=年, 4=会期, 5=場所
+      （DEBUG 実DOMで確認済み）  [1](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_kagaku_page_parse.html)
     """
     session = make_session()
 
@@ -147,48 +147,42 @@ def fetch_kagaku():
         "https://www.kagaku.com/calendar.php"
         "?selectgenre=society_all&selectpref=all_area&submit=%B8%A1%BA%F7&eid=none"
     )
-    url_table = (
-        "https://www.kagaku.com/calendartable.php"
-        "?selectgenre=society_all&selectpref=all_area&eid=none"
-    )
 
-    def _parse_tables(soup, url_ctx):
-        out = []
+    rows = []
+    try:
+        html = get_html(url_page, session)
+        _save_debug("kagaku_page_parse", html)
+        soup = BeautifulSoup(html, "lxml")  # lxml パーサー
+
+        # 「イベント／会期」などのラベルを含む表だけを対象
+        candidate_tables = []
         for tb in soup.find_all("table"):
             txt = tb.get_text(" ", strip=True)
-            if not any(k in txt for k in ["イベント", "イベント名", "イベントの名称", "会期"]):
-                continue
+            if ("イベント" in txt or "イベントの名称" in txt) and ("会期" in txt or "場所" in txt):
+                candidate_tables.append(tb)
 
-            # th（ヘッダ）を除いた実体行のみ
+        for tb in candidate_tables:
             for tr in tb.find_all("tr"):
-                if tr.find("th"):
-                    continue
                 tds = tr.find_all("td")
-                if len(tds) < 2:
-                    continue
+                if len(tds) < 5:
+                    continue  # 欠損行やヘッダ様行は除外
 
-                cells = [td.get_text(" ", strip=True) for td in tds]
+                # 列から素直に取る（a/imgに依存しない）
+                title = tds[1].get_text(" ", strip=True)
+                date_text = tds[3].get_text(" ", strip=True)
+                venue = tds[4].get_text(" ", strip=True)
 
-                # タイトルとURL（行内の最初の a[href]）
-                a = tr.find("a", href=True)
-                title = a.get_text(" ", strip=True) if a else (cells[0] if cells else None)
-                link = urljoin(url_ctx, a["href"]) if (a and a.get("href")) else None
-                if link and not link.startswith(("http://", "https://")):
-                    link = None
-
-                # 会期候補（セル内から日付らしさで）
-                date_text = None
-                for c in cells:
-                    if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', c) or re.search(r'\d{1,2}/\d{1,2}', c):
-                        date_text = c
+                # 公式リンク（2列目の a[href] のうち外部URLらしいもの）
+                link = None
+                for a in tds[1].find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith(("http://", "https://")):
+                        link = href
                         break
+
                 start, end = parse_date_range(date_text or "")
-
-                # 場所（終端列を優先）
-                venue = cells[-1] if cells else None
-
                 if title and (start or end):
-                    out.append({
+                    rows.append({
                         "source": "kagaku",
                         "title": title,
                         "start_date": start,
@@ -196,31 +190,11 @@ def fetch_kagaku():
                         "venue": venue,
                         "url": link
                     })
-        return out
 
-    rows = []
-
-    try:
-        # 1) calendar.php を先にアクセス（同一セッションで条件を保持）
-        _ = get_html(url_page, session)
-        # 2) calendartable.php を同セッションで取得（Referer 付与）
-        html = get_html(url_table, session, headers={"Referer": url_page})
-        _save_debug("kagaku_table_after_page", html)
-        soup = BeautifulSoup(html, "html.parser")
-        rows.extend(_parse_tables(soup, url_table))
     except Exception as e:
         logger.exception("kagaku fetch failed: %s", e)
 
-    if not rows:
-        # 最終フォールバック：calendar.php 自体のページからも探す
-        try:
-            html = get_html(url_page, session)
-            _save_debug("kagaku_page_parse", html)
-            soup = BeautifulSoup(html, "html.parser")
-            rows.extend(_parse_tables(soup, url_page))
-        except Exception as e2:
-            logger.warning("kagaku page fallback failed: %s", e2)
-
+    logger.info("kagaku: parsed rows=%d", len(rows))
     return pd.DataFrame(rows)
 
 
@@ -228,10 +202,12 @@ def fetch_kagaku():
 def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"):
     """
     東京ビッグサイト:
-    - 起点は search.php?page=1
-    - 各 <article class="lyt-event-01"> の中から
-      タイトル, 開催期間(ddテキストから日付パターンで), 公式URL(「URL」ラベル or 最初の a) を抽出
-    - ページャの「次へ」を追って最後まで
+    - <article class="lyt-event-01"> 単位で列挙
+    - 開催期間は dl.list-01 内の dt「開催期間」→ dd を優先取得
+      取れない場合のみ dd 群を正規表現で総当たり
+    - URL は dt「URL」→ dd の a[href] を優先、無ければ記事内の最初の外部リンク
+    - ページャの「次へ」を最後まで
+      （DEBUG 実DOM・最終ページ #20 を確認済み）  [3](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_bigsight_20.html)
     """
     session = make_session()
     rows = []
@@ -244,21 +220,34 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         absu = urljoin(ctx, u)
         return absu if absu.startswith(("http://", "https://")) else None
 
-    def _pick_date_from_dds(art):
-        # dl.list-01 内の dd を総当たりでチェック
+    def _dd_by_label(art, label):
+        # dl.list-01 の「dt=label → dd」テキストを返す
+        for div in art.select("dl.list-01 div"):
+            dt_el, dd_el = div.find("dt"), div.find("dd")
+            if not dt_el or not dd_el:
+                continue
+            if label in dt_el.get_text(strip=True):
+                return dd_el.get_text(" ", strip=True)
+        return None
+
+    def _pick_date(art):
+        # 1) ラベル「開催期間」優先
+        v = _dd_by_label(art, "開催期間")
+        if v:
+            return v
+        # 2) フォールバック：dd群パターン
         for dd in art.select("dl.list-01 dd"):
             txt = dd.get_text(" ", strip=True)
-            # 期間（年付き→年なしフォールバック→単発）
             if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?.*?(〜|～|-|－|—|–|―).*?\d{1,2}月?\d{1,2}日?', txt):
                 return txt
             if re.search(r'\d{1,2}/\d{1,2}.*?(〜|～|-|－|—|–|―).*?\d{1,2}/\d{1,2}', txt):
                 return txt
-            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):  # 単発日
+            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):
                 return txt
         return None
 
     def _pick_official_url(art, ctx):
-        # まず「URL」ラベルの dd にある a[href]
+        # 1) ラベルURLの a[href]
         for div in art.select("dl.list-01 div"):
             dt_el, dd_el = div.find("dt"), div.find("dd")
             if not dt_el or not dd_el:
@@ -269,18 +258,11 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
                     u = _to_abs(a["href"], ctx)
                     if u:
                         return u
-        # 無ければ記事内の最初の a[href]
-        a = art.find("a", href=True)
-        return _to_abs(a["href"], ctx) if a else None
-
-    def _pick_venue(art):
-        # 「利用施設」を venue として取得（存在しない場合は None）
-        for div in art.select("dl.list-01 div"):
-            dt_el, dd_el = div.find("dt"), div.find("dd")
-            if not dt_el or not dd_el:
-                continue
-            if "利用施設" in dt_el.get_text(strip=True):
-                return dd_el.get_text(" ", strip=True)
+        # 2) 記事内の最初の外部リンク
+        for a in art.find_all("a", href=True):
+            u = _to_abs(a["href"], ctx)
+            if u and not u.startswith(("https://www.bigsight.jp", "http://www.bigsight.jp")):
+                return u
         return None
 
     while page_url and page_url not in seen_pages:
@@ -292,24 +274,23 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
             break
 
         _save_debug(f"bigsight_{len(seen_pages):02d}", html)
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")  # lxml パーサー
 
-        articles = soup.select("article.lyt-event-01")
-        for art in articles:
-            # タイトル
+        arts = soup.select("article.lyt-event-01")
+        logger.info("bigsight: %s -> articles=%d (accum=%d)", page_url, len(arts), len(rows))
+        for art in arts:
+            # タイトル（h3 > a が無ければ h3 テキスト）
             h3 = art.find("h3", class_="hdg-01")
             a_title = h3.find("a", href=True) if h3 else None
             title = a_title.get_text(" ", strip=True) if a_title else (h3.get_text(" ", strip=True) if h3 else None)
 
-            # 日付（dd 群から日付パターンで抽出）
-            date_text = _pick_date_from_dds(art)
+            date_text = _pick_date(art)
             start, end = parse_date_range(date_text or "")
 
-            # 公式 URL（「URL」欄 → 無ければ記事内先頭 a）
             link = _pick_official_url(art, page_url)
 
             # 会場（任意）
-            venue = _pick_venue(art)
+            venue = _dd_by_label(art, "利用施設")
 
             if title and (start or end):
                 rows.append({
@@ -321,7 +302,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
                     "url": link
                 })
 
-        # 次へ（存在すれば続行）
+        # 次へ
         next_a = soup.select_one("div.list-pager-01 p.next a[href]")
         page_url = _to_abs(next_a["href"], page_url) if next_a else None
 
@@ -331,12 +312,12 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
 # ---------------- Site C: Makuhari Messe (print) ----------------
 def fetch_makuhari(url="https://www.m-messe.co.jp/event/print"):
     """
-    幕張メッセ印刷用ページ（表）から抽出
+    幕張メッセ印刷用ページ（表）から抽出（実DOMは印刷用テーブルで安定）  [2](https://nikkeikin-my.sharepoint.com/personal/satoshi-takeda_nikkeikin_co_jp/Documents/Microsoft%20Copilot%20Chat%20%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB/_debug_kagaku_table_after_page.html)
     """
     session = make_session()
     html = get_html(url, session)
     _save_debug("makuhari", html)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")  # lxml パーサー
 
     rows = []
     table = soup.find("table")
