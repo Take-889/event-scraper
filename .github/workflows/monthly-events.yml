@@ -1,46 +1,39 @@
-name: Monthly Events Aggregation
+name: Build events
 
 on:
-  schedule:
-    - cron: "0 22 1 * *"  # 毎月1日 07:00 JST 実行（22:00 UTC=翌日7:00 JSTではないため、JST→UTC換算要）
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'  # 毎週月曜 00:00 UTC
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas python-dateutil
+          python -V
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip freeze
 
       - name: Run script
-        run: python events_monthly.py
+        env:
+          LOG_LEVEL: INFO
+          DEBUG_HTML: '1'   # 必要に応じて '1'
+        run: |
+          python events_monthly.py
 
-      # ▼ 先に成果物を上げる（確実）
-      - name: Upload debug pages
-        if: always()   # ← 途中で失敗しても成果物を必ずアップロード
+      - name: Upload artifacts (debug HTML / CSV)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-pages
+          name: outputs
           path: |
-            _debug_*.html
             events_agg.csv
-            events_agg.xlsx
-
-      # ▼ その後にコミット（失敗してもOK）
-      - name: Commit CSV
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add events_agg.csv
-          git commit -m "Update monthly events CSV [skip ci]" || echo "No changes"
-          git push
+            _debug_*.html
