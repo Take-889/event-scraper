@@ -3,32 +3,83 @@ name: Build events
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 1'  # 毎週月曜 00:00 UTC
+    - cron: '0 0 * * 1'   # 毎週月曜 00:00 UTC（JST 09:00）
+
+permissions:
+  contents: read
+
+# 同名ワークフローの並列実行がぶつからないようにする
+concurrency:
+  group: monthly-events-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Show environment
         run: |
           python -V
+          which python
+          uname -a
+
+      - name: List repository tree (top-level)
+        run: |
+          ls -la
+          echo "-----"
+          if [ -f requirements.txt ]; then
+            echo "requirements.txt found:"
+            cat requirements.txt
+          else
+            echo "requirements.txt not found."
+          fi
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          set -e
           pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            echo "[INFO] Installing from requirements.txt"
+            pip install -r requirements.txt
+          else
+            echo "[WARN] requirements.txt not found. Installing minimal deps..."
+            pip install \
+              requests==2.31.0 \
+              beautifulsoup4==4.12.3 \
+              pandas==2.2.2 \
+              python-dateutil==2.9.0.post0 \
+              lxml==5.2.1
+          fi
+          echo "[INFO] Installed packages:"
           pip freeze
 
       - name: Run script
         env:
-          LOG_LEVEL: INFO
-          DEBUG_HTML: '1'   # 必要に応じて '1'
+          LOG_LEVEL: INFO        # DEBUG にすると詳細ログ
+          DEBUG_HTML: '1'        # '1' で _debug_*.html を保存
         run: |
+          set -e
           python events_monthly.py
+          echo "---- Output head ----"
+          head -n 20 events_agg.csv || true
 
+      # 成否に関わらず成果物をアップロード
       - name: Upload artifacts (debug HTML / CSV)
         if: always()
         uses: actions/upload-artifact@v4
