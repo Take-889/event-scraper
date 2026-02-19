@@ -204,8 +204,8 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     東京ビッグサイト:
     - <article class="lyt-event-01"> を列挙
     - 開催期間は dt ラベル（開催期間/会期/開催日程/期間）の正規化一致 → 直後 dd を優先
-      失敗時は dd 群、それでも失敗時は article 全文テキストから正規表現で抽出
-    - URL は dt=URL の a[href] を優先、無ければ記事内の外部リンク先頭
+      失敗時は dl 内 dd 群、その次は article 全文テキストから強めの正規表現で抽出（DOM 非依存）
+    - URL は dt=URL の dd>a[href] を優先、無ければ記事内の外部リンク先頭
     - ページャ「次へ」を Referer 付きで最後まで
     """
     session = make_session()
@@ -227,84 +227,90 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     LABEL_URL   = _norm_label("URL")
     LABEL_VENUE = _norm_label("利用施設")
 
-    # 日付抽出用の“強い”正規表現（YYYY年..〜..YYYY年.. / 片側年なしも許容）
-    re_range_year_to_year = re.compile(
-        r'(?P<s>\d{4}年\d{1,2}月\d{1,2}日?)\s*?[〜～\-－—–―]\s*?(?P<e>\d{4}年\d{1,2}月\d{1,2}日?)'
+    # 年年レンジ / 左だけ年付きレンジ / 単発
+    re_range_y_to_y = re.compile(
+        r'(?P<y1>\d{4})年\s*(?P<m1>\d{1,2})月\s*(?P<d1>\d{1,2})日?\s*?[〜～\-－—–―]\s*?'
+        r'(?P<y2>\d{4})年\s*(?P<m2>\d{1,2})月\s*(?P<d2>\d{1,2})日?'
     )
-    re_range_year_to_md   = re.compile(
-        r'(?P<s>\d{4}年\d{1,2}月\d{1,2}日?)\s*?[〜～\-－—–―]\s*?(?P<e>\d{1,2}月\d{1,2}日?)'
+    re_range_y_to_md = re.compile(
+        r'(?P<y1>\d{4})年\s*(?P<m1>\d{1,2})月\s*(?P<d1>\d{1,2})日?\s*?[〜～\-－—–―]\s*?'
+        r'(?P<m2>\d{1,2})月\s*(?P<d2>\d{1,2})日?'
     )
-    re_single_with_year   = re.compile(r'(?P<d>\d{4}年\d{1,2}月\d{1,2}日?)')
+    re_single_y = re.compile(
+        r'(?P<y1>\d{4})年\s*(?P<m1>\d{1,2})月\s*(?P<d1>\d{1,2})日?'
+    )
 
-    def _dt_to_dd_texts(dl_node):
-        """div 有無に依存せず dt→直近の dd を対応付ける"""
+    def _to_iso(y, m, d):
+        try:
+            return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+        except Exception:
+            return None
+
+    def _find_dates(text: str):
+        """文字列から (start_iso, end_iso) を抽出（成功すればタプル、失敗で (None, None)）"""
+        if not text:
+            return None, None
+        t = re.sub(r'（.*?）', '', text)  # 曜日など括弧内除去
+        # 年→年
+        m = re_range_y_to_y.search(t)
+        if m:
+            s = _to_iso(m.group("y1"), m.group("m1"), m.group("d1"))
+            e = _to_iso(m.group("y2"), m.group("m2"), m.group("d2"))
+            return s, e
+        # 年→月日
+        m = re_range_y_to_md.search(t)
+        if m:
+            s = _to_iso(m.group("y1"), m.group("m1"), m.group("d1"))
+            # 右側の年は左側の年を継承
+            e = _to_iso(m.group("y1"), m.group("m2"), m.group("d2"))
+            return s, e
+        # 単発日
+        m = re_single_y.search(t)
+        if m:
+            d = _to_iso(m.group("y1"), m.group("m1"), m.group("d1"))
+            return d, d
+        return None, None
+
+    def _dt_to_dd_map(dl_node):
+        """div の有無に依らず dt→直近 dd を対応付け"""
         out = {}
         for dt in dl_node.find_all("dt"):
             lab = _norm_label(dt.get_text(" ", strip=True))
             dd = dt.find_next_sibling("dd")
             if lab and dd:
-                out[lab] = dd.get_text(" ", strip=True)
+                out[lab] = dd
         return out
 
-    def _extract_date_from_text(text: str):
-        """記事テキスト全体から日付レンジを抽出（DOM最後の砦）"""
-        t = re.sub(r'（.*?）', '', text)  # 曜日など括弧内を除去
-        # 年→年
-        m = re_range_year_to_year.search(t)
-        if m:
-            return f"{m.group('s')}〜{m.group('e')}"
-        # 年→月日
-        m = re_range_year_to_md.search(t)
-        if m:
-            return f"{m.group('s')}〜{m.group('e')}"
-        # 単発日
-        m = re_single_with_year.search(t)
-        if m:
-            return m.group('d')
-        return None
-
     def _pick_date(art):
-        # 1) dl 内のラベル一致で優先取得
+        # 1) dl のラベルで
         dl = art.find("dl", class_="list-01")
         if dl:
-            pairs = _dt_to_dd_texts(dl)
+            pairs = _dt_to_dd_map(dl)
             for lab in LABELS_DATE:
-                if lab in pairs and pairs[lab]:
-                    return pairs[lab]
-            # 2) dl 内 dd 群からレンジらしさで抽出
+                if lab in pairs:
+                    s, e = _find_dates(pairs[lab].get_text(" ", strip=True))
+                    if s or e:
+                        return s, e
+            # 2) dl 内 dd 群で
             for dd in dl.find_all("dd"):
-                txt = dd.get_text(" ", strip=True)
-                if _extract_date_from_text(txt):
-                    return txt
-        # 3) 最終：記事テキスト全体から抽出
-        return _extract_date_from_text(art.get_text(" ", strip=True))
+                s, e = _find_dates(dd.get_text(" ", strip=True))
+                if s or e:
+                    return s, e
+        # 3) 記事全文から
+        s, e = _find_dates(art.get_text(" ", strip=True))
+        return s, e
 
     def _pick_official_url(art, ctx):
-        # 1) dt=URL の dd 内の a[href]
+        # 1) dt=URL の dd 内 a[href]
         dl = art.find("dl", class_="list-01")
         if dl:
-            pairs = _dt_to_dd_texts(dl)
+            pairs = _dt_to_dd_map(dl)
             if LABEL_URL in pairs:
-                # dd 内の a[href] を優先
-                dd_node = None
-                # pairs から dd ノードに戻せないため、近傍検索
-                for div in dl.find_all("div"):
-                    dt_el, dd_el = div.find("dt"), div.find("dd")
-                    if dt_el and dd_el and _norm_label(dt_el.get_text(strip=True)) == LABEL_URL:
-                        dd_node = dd_el
-                        break
-                if not dd_node:
-                    # div ラッパーが無い場合の保険
-                    for dt in dl.find_all("dt"):
-                        if _norm_label(dt.get_text(strip=True)) == LABEL_URL:
-                            dd_node = dt.find_next_sibling("dd")
-                            break
-                if dd_node:
-                    for a in dd_node.find_all("a", href=True):
-                        u = _to_abs(a.get("href"), ctx)
-                        if u:
-                            return u
-        # 2) 記事内の最初の“外部”リンク
+                for a in pairs[LABEL_URL].find_all("a", href=True):
+                    u = _to_abs(a.get("href"), ctx)
+                    if u:
+                        return u
+        # 2) 記事内の外部リンク先頭
         for a in art.find_all("a", href=True):
             u = _to_abs(a.get("href"), ctx)
             if u and not u.startswith(("https://www.bigsight.jp", "http://www.bigsight.jp")):
@@ -315,11 +321,10 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         dl = art.find("dl", class_="list-01")
         if not dl:
             return None
-        pairs = _dt_to_dd_texts(dl)
-        v = pairs.get(LABEL_VENUE)
-        if v:
-            return v
-        # 予備：ホール名らしき語を dd 群から拾う
+        pairs = _dt_to_dd_map(dl)
+        if LABEL_VENUE in pairs:
+            return pairs[LABEL_VENUE].get_text(" ", strip=True)
+        # 予備：ホール/会場らしさ
         for dd in dl.find_all("dd"):
             t = dd.get_text(" ", strip=True)
             if any(k in t for k in ["ホール", "会議棟", "会場"]):
@@ -332,16 +337,11 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     while page_url and page_url not in seen_pages:
         seen_pages.add(page_url)
         headers = {"Referer": referer} if referer else None
-        try:
-            html = get_html(page_url, session, headers=headers)
-        except Exception as e:
-            logger.warning("bigsight fetch error on %s: %s", page_url, e)
-            break
-
+        html = get_html(page_url, session, headers=headers)
         _save_debug(f"bigsight_{len(seen_pages):02d}", html)
         soup = BeautifulSoup(html, "lxml")
 
-        arts = soup.find_all("article", class_=lambda c: c and "lyt-event-01" in c)
+        arts = soup.select("main.event article.lyt-event-01, article.lyt-event-01")
         logger.info("bigsight: %s -> articles=%d (accum=%d)", page_url, len(arts), len(rows))
 
         for art in arts:
@@ -350,16 +350,12 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
             a_title = h3.find("a", href=True) if h3 else None
             title = a_title.get_text(" ", strip=True) if a_title else (h3.get_text(" ", strip=True) if h3 else None)
 
-            # 開催期間 → 日付解析
-            date_text = _pick_date(art)
-            start, end = parse_date_range(date_text or "")
+            # 開催期間（ISO まで確定）
+            start, end = _pick_date(art)
 
-            # 公式URL・会場
+            # 公式URL / 会場
             link = _pick_official_url(art, page_url)
             venue = _pick_venue(art)
-
-            if not date_text:
-                logger.debug("bigsight: no date text for title=%r on page=%s", title, page_url)
 
             if title and (start or end):
                 rows.append({
@@ -371,14 +367,13 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
                     "url": link
                 })
 
-        # 次へ（Referer を直前ページに）
+        # 次へ
         next_a = soup.select_one("div.list-pager-01 p.next a[href]")
         referer = page_url
         page_url = _to_abs(next_a["href"], page_url) if next_a else None
 
-    # 0件のときは検証用にヒントを出す
     if not rows:
-        logger.info("bigsight: parsed 0 rows. Please check _debug_bigsight_01/02.html and logs for 'no date text'.")
+        logger.info("bigsight: parsed 0 rows. Enable DEBUG to print 'no date' hints and inspect _debug_bigsight_*.html")
     return pd.DataFrame(rows)
 
 
@@ -474,6 +469,7 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
 
