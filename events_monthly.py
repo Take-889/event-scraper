@@ -510,9 +510,10 @@ def collect_all():
 
 def monthly_run(output_csv="events_agg.csv"):
     df = collect_all()
-    df.to_csv(output_csv, index=False, encoding="utf-8")
+    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     logger.info("Saved: %s (%d rows)", output_csv, len(df))
 
 
 if __name__ == "__main__":
     monthly_run()
+
