@@ -3,7 +3,7 @@ name: Monthly run (1st 08:00 UTC)
 on:
   schedule:
     - cron: '0 8 1 * *'   # 毎月1日 08:00 UTC
-  workflow_dispatch:       # 手動実行も可（任意）
+  workflow_dispatch:
 
 jobs:
   run:
@@ -23,8 +23,9 @@ jobs:
       - name: Run script
         run: python events_monthly.py
 
-      # 生成CSVをアーティファクトで取得したい場合（任意）
-      # - uses: actions/upload-artifact@v4
-      #   with:
-      #     name: events_agg_csv
-      #     path: events_agg.csv
+      - name: Upload artifact (events_agg.csv)
+        uses: actions/upload-artifact@v4
+        with:
+          name: events_agg_csv
+          path: events_agg.csv
+          if-no-files-found: error
