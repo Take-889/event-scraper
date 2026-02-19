@@ -203,8 +203,8 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     """
     東京ビッグサイト:
     - <article class="lyt-event-01"> を列挙
-    - 開催期間は dt のラベル正規化でマッチ（開催期間/会期/開催日程/期間）
-      → 直後の dd を優先。失敗時は dd 群を正規表現でフォールバック抽出
+    - 開催期間は dt ラベル（開催期間/会期/開催日程/期間）の正規化一致 → 直後 dd を優先
+      失敗時は dd 群、それでも失敗時は article 全文テキストから正規表現で抽出
     - URL は dt=URL の a[href] を優先、無ければ記事内の外部リンク先頭
     - ページャ「次へ」を Referer 付きで最後まで
     """
@@ -227,13 +227,18 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     LABEL_URL   = _norm_label("URL")
     LABEL_VENUE = _norm_label("利用施設")
 
+    # 日付抽出用の“強い”正規表現（YYYY年..〜..YYYY年.. / 片側年なしも許容）
+    re_range_year_to_year = re.compile(
+        r'(?P<s>\d{4}年\d{1,2}月\d{1,2}日?)\s*?[〜～\-－—–―]\s*?(?P<e>\d{4}年\d{1,2}月\d{1,2}日?)'
+    )
+    re_range_year_to_md   = re.compile(
+        r'(?P<s>\d{4}年\d{1,2}月\d{1,2}日?)\s*?[〜～\-－—–―]\s*?(?P<e>\d{1,2}月\d{1,2}日?)'
+    )
+    re_single_with_year   = re.compile(r'(?P<d>\d{4}年\d{1,2}月\d{1,2}日?)')
+
     def _dt_to_dd_texts(dl_node):
-        """
-        dl ノードから {正規化ラベル: ddテキスト} を作る。
-        div の有無に依存せず、dt → 直近の next_sibling dd を辿る。
-        """
+        """div 有無に依存せず dt→直近の dd を対応付ける"""
         out = {}
-        # まず全 dt を順に回し、それぞれに最初の dd 兄弟を紐づけ
         for dt in dl_node.find_all("dt"):
             lab = _norm_label(dt.get_text(" ", strip=True))
             dd = dt.find_next_sibling("dd")
@@ -241,37 +246,65 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
                 out[lab] = dd.get_text(" ", strip=True)
         return out
 
-    def _pick_date(art):
-        dl = art.find("dl", class_="list-01")
-        if not dl:
-            return None
-        pairs = _dt_to_dd_texts(dl)
-        # 1) ラベルから優先取得
-        for lab in LABELS_DATE:
-            if lab in pairs and pairs[lab]:
-                return pairs[lab]
-        # 2) フォールバック：dd 群から日付パターン抽出
-        for dd in dl.find_all("dd"):
-            txt = dd.get_text(" ", strip=True)
-            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?.*?(〜|～|-|－|—|–|―).*?\d{1,2}月?\d{1,2}日?', txt):
-                return txt
-            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):  # 単発日も許容
-                return txt
+    def _extract_date_from_text(text: str):
+        """記事テキスト全体から日付レンジを抽出（DOM最後の砦）"""
+        t = re.sub(r'（.*?）', '', text)  # 曜日など括弧内を除去
+        # 年→年
+        m = re_range_year_to_year.search(t)
+        if m:
+            return f"{m.group('s')}〜{m.group('e')}"
+        # 年→月日
+        m = re_range_year_to_md.search(t)
+        if m:
+            return f"{m.group('s')}〜{m.group('e')}"
+        # 単発日
+        m = re_single_with_year.search(t)
+        if m:
+            return m.group('d')
         return None
 
+    def _pick_date(art):
+        # 1) dl 内のラベル一致で優先取得
+        dl = art.find("dl", class_="list-01")
+        if dl:
+            pairs = _dt_to_dd_texts(dl)
+            for lab in LABELS_DATE:
+                if lab in pairs and pairs[lab]:
+                    return pairs[lab]
+            # 2) dl 内 dd 群からレンジらしさで抽出
+            for dd in dl.find_all("dd"):
+                txt = dd.get_text(" ", strip=True)
+                if _extract_date_from_text(txt):
+                    return txt
+        # 3) 最終：記事テキスト全体から抽出
+        return _extract_date_from_text(art.get_text(" ", strip=True))
+
     def _pick_official_url(art, ctx):
+        # 1) dt=URL の dd 内の a[href]
         dl = art.find("dl", class_="list-01")
         if dl:
             pairs = _dt_to_dd_texts(dl)
             if LABEL_URL in pairs:
-                dd_text = pairs[LABEL_URL]
-                a = dl.find("a", href=True)
-                # dd 内の最初の a[href]
-                for a in dl.find_all("a", href=True):
-                    u = _to_abs(a.get("href"), ctx)
-                    if u:
-                        return u
-        # 記事内の外部リンク先頭
+                # dd 内の a[href] を優先
+                dd_node = None
+                # pairs から dd ノードに戻せないため、近傍検索
+                for div in dl.find_all("div"):
+                    dt_el, dd_el = div.find("dt"), div.find("dd")
+                    if dt_el and dd_el and _norm_label(dt_el.get_text(strip=True)) == LABEL_URL:
+                        dd_node = dd_el
+                        break
+                if not dd_node:
+                    # div ラッパーが無い場合の保険
+                    for dt in dl.find_all("dt"):
+                        if _norm_label(dt.get_text(strip=True)) == LABEL_URL:
+                            dd_node = dt.find_next_sibling("dd")
+                            break
+                if dd_node:
+                    for a in dd_node.find_all("a", href=True):
+                        u = _to_abs(a.get("href"), ctx)
+                        if u:
+                            return u
+        # 2) 記事内の最初の“外部”リンク
         for a in art.find_all("a", href=True):
             u = _to_abs(a.get("href"), ctx)
             if u and not u.startswith(("https://www.bigsight.jp", "http://www.bigsight.jp")):
@@ -283,7 +316,15 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         if not dl:
             return None
         pairs = _dt_to_dd_texts(dl)
-        return pairs.get(LABEL_VENUE)
+        v = pairs.get(LABEL_VENUE)
+        if v:
+            return v
+        # 予備：ホール名らしき語を dd 群から拾う
+        for dd in dl.find_all("dd"):
+            t = dd.get_text(" ", strip=True)
+            if any(k in t for k in ["ホール", "会議棟", "会場"]):
+                return t
+        return None
 
     rows, seen_pages = [], set()
     page_url, referer = url, None
@@ -300,7 +341,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         _save_debug(f"bigsight_{len(seen_pages):02d}", html)
         soup = BeautifulSoup(html, "lxml")
 
-        arts = soup.select("article.lyt-event-01")
+        arts = soup.find_all("article", class_=lambda c: c and "lyt-event-01" in c)
         logger.info("bigsight: %s -> articles=%d (accum=%d)", page_url, len(arts), len(rows))
 
         for art in arts:
@@ -317,7 +358,6 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
             link = _pick_official_url(art, page_url)
             venue = _pick_venue(art)
 
-            # 取りこぼし検知のためのデバッグ
             if not date_text:
                 logger.debug("bigsight: no date text for title=%r on page=%s", title, page_url)
 
@@ -336,6 +376,9 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         referer = page_url
         page_url = _to_abs(next_a["href"], page_url) if next_a else None
 
+    # 0件のときは検証用にヒントを出す
+    if not rows:
+        logger.info("bigsight: parsed 0 rows. Please check _debug_bigsight_01/02.html and logs for 'no date text'.")
     return pd.DataFrame(rows)
 
 
@@ -431,5 +474,6 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
 
 
