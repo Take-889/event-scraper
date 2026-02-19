@@ -14,9 +14,11 @@ from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
 
 try:
-    from urllib3.util.retry import Retry  # urllib3 v1/v2 両対応
+    # urllib3 v1/v2 両対応
+    from urllib3.util.retry import Retry
 except Exception:
     Retry = None
+
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -31,6 +33,7 @@ DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
 
 # ---------------- Utilities ----------------
 def _save_debug(name: str, text: str) -> None:
+    """Save HTML for debugging (optional via DEBUG_HTML=1)."""
     if not DEBUG_HTML:
         return
     fn = f"_debug_{name}.html"
@@ -40,23 +43,39 @@ def _save_debug(name: str, text: str) -> None:
 
 
 def make_session() -> requests.Session:
+    """Make a requests Session with retries and default headers."""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.2; +https://example.org)",
+        "User-Agent": "Mozilla/5.0 (compatible; EventsAggregator/1.3; +https://example.org)",
         "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
     })
-    adapter = HTTPAdapter(max_retries=Retry(
-        total=3, connect=3, read=3, backoff_factor=0.7,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "HEAD"])
-    )) if Retry else HTTPAdapter()
+    # リトライは利用可能な場合のみ設定
+    if Retry is not None:
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.7,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "HEAD"])
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+    else:
+        adapter = HTTPAdapter()
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
 
 
-def get_html(url: str, session: requests.Session, timeout: int = 30) -> str:
-    r = session.get(url, timeout=timeout)
+def get_html(url: str, session: requests.Session, timeout: int = 30, headers: dict | None = None) -> str:
+    """
+    Fetch HTML with robust encoding decision:
+    1) charset from Content-Type
+    2) apparent_encoding
+    3) response.encoding
+    4) utf-8 (fallback)
+    """
+    r = session.get(url, timeout=timeout, headers=headers or {})
     r.raise_for_status()
     ctype = r.headers.get("Content-Type", "")
     m = re.search(r"charset=([^\s;]+)", ctype, flags=re.I)
@@ -67,20 +86,29 @@ def get_html(url: str, session: requests.Session, timeout: int = 30) -> str:
 
 # ---------------- Date parsing ----------------
 def parse_date_range(text: str):
+    """
+    '2026年02月18日（水）～2026年02月20日（金）'
+    '2/18 水-2/20 金'
+    -> (YYYY-MM-DD, YYYY-MM-DD)
+    """
     if not text:
         return None, None
 
     t = str(text)
+
     # 括弧内削除（全角/半角）
     t = re.sub(r'（.*?）', '', t)
     t = re.sub(r'\(.*?\)', '', t)
+
     # 曜日・空白の削除
     t = re.sub(r'(月|火|水|木|金|土|日)曜?', '', t)
     t = re.sub(r'\s+', '', t)
-    # 区切り統一
+
+    # 区切り統一（各種ダッシュ/チルダを 〜 に寄せる）
     for ch in ['〜', '～', '-', '−', '—', '–', '－', '―']:
         t = t.replace(ch, '〜')
-    # 和文年月日をスラッシュ化
+
+    # 和文年月日をスラッシュ化（限定的に）
     t = t.replace('年', '/').replace('月', '/').replace('日', '')
 
     parts = t.split('〜')
@@ -111,8 +139,9 @@ def parse_date_range(text: str):
 def fetch_kagaku() -> pd.DataFrame:
     """
     科学カレンダー:
-    1) calendar.php の検索結果ページを優先的にパース
-    2) だめなら calendartable.php をフォールバック
+    - まず calendar.php を叩いて検索条件をセッションに反映
+    - 同じ Session で calendartable.php を取得してテーブルをパース
+    - 0件なら最終フォールバックとして calendar.php 自体からも抽出を試みる
     """
     session = make_session()
 
@@ -128,12 +157,11 @@ def fetch_kagaku() -> pd.DataFrame:
     def _parse_tables(soup: BeautifulSoup, url_ctx: str) -> list[dict]:
         out = []
         for tb in soup.find_all("table"):
-            # 表内に「イベント」や「会期」が含まれるものに限定
             txt = tb.get_text(" ", strip=True)
             if not any(k in txt for k in ["イベント", "イベント名", "イベントの名称", "会期"]):
                 continue
 
-            # 行を走査（見出し行=th をスキップ）
+            # th（ヘッダ）を除いた実体行のみ
             for tr in tb.find_all("tr"):
                 if tr.find("th"):
                     continue
@@ -142,17 +170,17 @@ def fetch_kagaku() -> pd.DataFrame:
                     continue
 
                 cells = [td.get_text(" ", strip=True) for td in tds]
-                # タイトルとURL
+                # タイトルとURL（行内の最初の a[href]）
                 a = tr.find("a", href=True)
                 title = a.get_text(" ", strip=True) if a else (cells[0] if cells else None)
                 link = urljoin(url_ctx, a["href"]) if (a and a.get("href")) else None
                 if link and not link.startswith(("http://", "https://")):
                     link = None
 
-                # 会期候補（セル内いずれかに「年/月」相当が入っている）
+                # 会期候補（セル内から日付らしさで）
                 date_text = None
                 for c in cells:
-                    if re.search(r'\d{1,2}/\d{1,2}', c) or ('年' in c and '月' in c):
+                    if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', c) or re.search(r'\d{1,2}/\d{1,2}', c):
                         date_text = c
                         break
                 start, end = parse_date_range(date_text or "")
@@ -173,252 +201,64 @@ def fetch_kagaku() -> pd.DataFrame:
 
     rows: list[dict] = []
 
-    # 1) 検索ページ（優先）
     try:
-        html = get_html(url_page, session)
-        _save_debug("kagaku_page", html)  # デバッグ
+        # 1) calendar.php を先にアクセス（同一セッションで条件を保持）
+        _ = get_html(url_page, session)
+        # 2) calendartable.php を同セッションで取得（Referer も付与）
+        html = get_html(url_table, session, headers={"Referer": url_page})
+        _save_debug("kagaku_table_after_page", html)
         soup = BeautifulSoup(html, "html.parser")
-        rows.extend(_parse_tables(soup, url_page))
+        rows.extend(_parse_tables(soup, url_table))
     except Exception as e:
-        logger.warning("kagaku page fetch failed: %s", e)
+        logger.exception("kagaku fetch failed: %s", e)
 
-    # 2) 0件ならフォールバック
     if not rows:
+        # 最終フォールバック：calendar.php 自体のページからも探す
         try:
-            html = get_html(url_table, session)
-            _save_debug("kagaku_table_fallback", html)
+            html = get_html(url_page, session)
+            _save_debug("kagaku_page_parse", html)
             soup = BeautifulSoup(html, "html.parser")
-            rows.extend(_parse_tables(soup, url_table))
-        except Exception as e:
-            logger.exception("kagaku fallback fetch failed: %s", e)
+            rows.extend(_parse_tables(soup, url_page))
+        except Exception as e2:
+            logger.warning("kagaku page fallback failed: %s", e2)
 
     return pd.DataFrame(rows)
 
 
-def _parse_kagaku_tables(tables, url_ctx):
-    rows = []
-    for tb in tables:
-        header_txt = tb.get_text(" ", strip=True)
-        # 見出しが「イベント／会期」を含むテーブルを優先
-        if not any(k in header_txt for k in ["イベント", "イベント名", "イベントの名称", "会期"]):
-            continue
-
-        for tr in tb.find_all("tr"):
-            cells = tr.find_all(["td", "th"])
-            if len(cells) < 2:
-                continue
-
-            # 見出し行スキップ
-            if tr.find("th"):
-                continue
-
-            texts = [c.get_text(" ", strip=True) for c in cells]
-            if not texts:
-                continue
-
-            title = texts[0]
-            # URL は行内の最初の a[href]
-            a = tr.find("a", href=True)
-            link = urljoin(url_ctx, a["href"]) if a and a.get("href") else None
-            if link and not link.startswith(("http://", "https://")):
-                link = None
-
-            # 会期候補（「会期」列が2列目付近にあることが多い）
-            date_text = None
-            for tx in texts:
-                if re.search(r'\d{1,2}/\d{1,2}', tx) or ('年' in tx and '月' in tx):
-                    date_text = tx
-                    break
-
-            start, end = parse_date_range(date_text or "")
-            venue = texts[-1] if texts else None
-
-            if title and (start or end):
-                rows.append({
-                    "source": "kagaku",
-                    "title": title,
-                    "start_date": start,
-                    "end_date": end,
-                    "venue": venue,
-                    "url": link
-                })
-    return rows
-
-
 # ---------------- Site B: Tokyo Big Sight ----------------
-def fetch_bigsight(url: str = "https://www.bigsight.jp/visitor/event/") -> pd.DataFrame:
+def fetch_bigsight(url: str = "https://www.bigsight.jp/visitor/event/search.php?page=1") -> pd.DataFrame:
     """
     東京ビッグサイト:
-    - 検索結果は <article class="lyt-event-01"> 単位
-    - タイトル: h3.hdg-01 > a
-    - 詳細: dl.list-01 の dt/ddd ペア（開催期間, URL など）
-    - ページャ: div.list-pager-01 p.next a[href]
+    - 起点は search.php?page=1
+    - 各 <article class="lyt-event-01"> の中から
+      タイトル, 開催期間(ddのテキストから日付パターンで), 公式URL(「URL」ラベル or 最初の a) を抽出
+    - ページャの「次へ」を追って最後まで
     """
     session = make_session()
     rows: list[dict] = []
     seen_pages: set[str] = set()
     page_url = url
 
-    def _to_abs(u: str, ctx: str) -> str | None:
+    def _to_abs(u: str | None, ctx: str) -> str | None:
         if not u:
             return None
         absu = urljoin(ctx, u)
         return absu if absu.startswith(("http://", "https://")) else None
 
-    def _get_dd_by_label(dl: BeautifulSoup, label: str) -> str | None:
-        # dt のテキストを見て一致した次の dd を返す
-        for div in dl.find_all("div", recursive=False):
-            dt_el = div.find("dt")
-            dd_el = div.find("dd")
-            if not dt_el or not dd_el:
-                continue
-            if label in dt_el.get_text(strip=True):
-                return dd_el.get_text(" ", strip=True)
+    def _pick_date_from_dds(art: BeautifulSoup) -> str | None:
+        # dl.list-01 内の dd を総当たりでチェック
+        for dd in art.select("dl.list-01 dd"):
+            txt = dd.get_text(" ", strip=True)
+            # 期間（年付き→年なしフォールバック→単発）
+            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?.*?(〜|～|-|－|—|–|―).*?\d{1,2}月?\d{1,2}日?', txt):
+                return txt
+            if re.search(r'\d{1,2}/\d{1,2}.*?(〜|～|-|－|—|–|―).*?\d{1,2}/\d{1,2}', txt):
+                return txt
+            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):  # 単発日
+                return txt
         return None
 
-    while page_url and page_url not in seen_pages:
-        seen_pages.add(page_url)
-        try:
-            html = get_html(page_url, session)
-        except Exception as e:
-            logger.warning("bigsight fetch error on %s: %s", page_url, e)
-            break
-
-        _save_debug(f"bigsight_{len(seen_pages):02d}", html)
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 1) イベントカード（記事）を列挙
-        articles = soup.select("article.lyt-event-01")
-        for art in articles:
-            # タイトル・リンク（h3内）
-            h3 = art.find("h3", class_="hdg-01")
-            a_title = h3.find("a", href=True) if h3 else None
-            title = a_title.get_text(" ", strip=True) if a_title else (h3.get_text(" ", strip=True) if h3 else None)
-            title_link = _to_abs(a_title["href"], page_url) if a_title else None
-
-            # 詳細 dl → dt/ddd
-            dl = art.find("dl", class_="list-01")
-            date_text = None
-            official_url = None
-            if dl:
-                # 「開催期間」と「URL」を拾う
-                date_text = _get_dd_by_label(dl, "開催期間")
-                dd_url = None
-                # 「URL」欄の dd から最初の a[href] を拾う
-                for div in dl.find_all("div", recursive=False):
-                    dt_el = div.find("dt")
-                    dd_el = div.find("dd")
-                    if not dt_el or not dd_el:
-                        continue
-                    if "URL" in dt_el.get_text(strip=True):
-                        a = dd_el.find("a", href=True)
-                        if a and a.get("href"):
-                            dd_url = _to_abs(a["href"], page_url)
-                            break
-                official_url = dd_url or title_link
-
-            start, end = parse_date_range(date_text or "")
-
-            if title and (start or end):
-                rows.append({
-                    "source": "bigsight",
-                    "title": title,
-                    "start_date": start,
-                    "end_date": end,
-                    "venue": None,  # 必要なら「利用施設」も同様に dd から取得可
-                    "url": official_url
-                })
-
-        # 2) 次ページ（ページャの「次へ」）
-        next_a = soup.select_one("div.list-pager-01 p.next a[href]")
-        page_url = _to_abs(next_a["href"], page_url) if next_a else None
-
-    return pd.DataFrame(rows)
-
-
-# ---------------- Site C: Makuhari Messe (print) ----------------
-def fetch_makuhari(url: str = "https://www.m-messe.co.jp/event/print") -> pd.DataFrame:
-    session = make_session()
-    html = get_html(url, session)
-    _save_debug("makuhari", html)
-    soup = BeautifulSoup(html, "html.parser")
-
-    rows = []
-    table = soup.find("table")
-    if not table:
-        return pd.DataFrame(rows)
-
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 2:
-            continue
-
-        vals = [td.get_text(" ", strip=True) for td in tds]
-        date_text = vals[0]
-        title = vals[1] if len(vals) > 1 else None
-        venue = vals[2] if len(vals) > 2 else None
-
-        # aタグ or テキスト中URL を拾う
-        a = tr.find("a", href=True)
-        link = urljoin(url, a["href"]) if (a and a.get("href")) else None
-        if not link:
-            tail = " ".join(vals[3:]) if len(vals) > 3 else ""
-            murl = re.search(r'(https?://[^\s]+)', tail)
-            link = murl.group(1) if murl else None
-
-        start, end = parse_date_range(date_text)
-        if title and (start or end):
-            rows.append({
-                "source": "makuhari",
-                "title": title,
-                "start_date": start,
-                "end_date": end,
-                "venue": venue,
-                "url": link
-            })
-
-    return pd.DataFrame(rows)
-
-
-# ---------------- Aggregation & Output ----------------
-def collect_all() -> pd.DataFrame:
-    dfs = []
-    for fetcher in (fetch_kagaku, fetch_bigsight, fetch_makuhari):
-        try:
-            df = fetcher()
-            if df is not None and not df.empty:
-                dfs.append(df)
-                logger.info("%s: %d rows", fetcher.__name__, len(df))
-            else:
-                logger.warning("%s: empty", fetcher.__name__)
-        except Exception as e:
-            logger.exception("%s failed: %s", fetcher.__name__, e)
-
-    if not dfs:
-        return pd.DataFrame(columns=["source", "title", "start_date", "end_date", "venue", "url"])
-
-    out = pd.concat(dfs, ignore_index=True)
-
-    keep_cols = ["source", "title", "start_date", "end_date", "venue", "url"]
-    for col in keep_cols:
-        if col not in out.columns:
-            out[col] = None
-    out = out[keep_cols].copy()
-
-    out["last_seen_at"] = datetime.now().strftime("%Y-%m-%d")
-
-    # 重複除去キーを強化（source + title + start_date + url）
-    out = out.drop_duplicates(subset=["source", "title", "start_date", "url"])
-    return out
-
-
-def monthly_run(output_csv: str = "events_agg.csv") -> None:
-    df = collect_all()
-    df.to_csv(output_csv, index=False, encoding="utf-8")
-    logger.info("Saved: %s (%d rows)", output_csv, len(df))
-
-
-if __name__ == "__main__":
-    monthly_run()
-
+    def _pick_official_url(art: BeautifulSoup, ctx: str) -> str | None:
+        # まず「URL」ラベルの dd にある a[href]
+        for div in art.select("dl.list-01 div"):
 
