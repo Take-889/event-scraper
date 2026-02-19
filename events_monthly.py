@@ -203,8 +203,8 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
     """
     東京ビッグサイト:
     - <article class="lyt-event-01"> を列挙
-    - 開催期間は「開催期間」「会期」いずれの dt でも OK（正規化一致）
-    - 取れない場合は dd 群から日付パターンをフォールバック抽出
+    - 開催期間は dt のラベル正規化でマッチ（開催期間/会期/開催日程/期間）
+      → 直後の dd を優先。失敗時は dd 群を正規表現でフォールバック抽出
     - URL は dt=URL の a[href] を優先、無ければ記事内の外部リンク先頭
     - ページャ「次へ」を Referer 付きで最後まで
     """
@@ -217,67 +217,76 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         return absu if absu.startswith(("http://", "https://")) else None
 
     def _norm_label(s: str) -> str:
-        if s is None:
+        if not s:
             return ""
-        # 全角コロン→半角、空白除去
         s = s.replace("：", ":")
         s = re.sub(r"\s+", "", s)
         return s
 
-    LABELS_DATE = {_norm_label("開催期間"), _norm_label("会期")}
+    LABELS_DATE = {_norm_label(x) for x in ["開催期間", "会期", "開催日程", "期間"]}
     LABEL_URL   = _norm_label("URL")
     LABEL_VENUE = _norm_label("利用施設")
 
-    def _dd_by_label(art, labels_set):
-        # dl.list-01 > div の dt/dd ペアを走査
-        for div in art.select("dl.list-01 div"):
-            dt_el, dd_el = div.find("dt"), div.find("dd")
-            if not dt_el or not dd_el:
-                continue
-            lab = _norm_label(dt_el.get_text(strip=True))
-            if lab in labels_set:
-                return dd_el.get_text(" ", strip=True)
-        return None
+    def _dt_to_dd_texts(dl_node):
+        """
+        dl ノードから {正規化ラベル: ddテキスト} を作る。
+        div の有無に依存せず、dt → 直近の next_sibling dd を辿る。
+        """
+        out = {}
+        # まず全 dt を順に回し、それぞれに最初の dd 兄弟を紐づけ
+        for dt in dl_node.find_all("dt"):
+            lab = _norm_label(dt.get_text(" ", strip=True))
+            dd = dt.find_next_sibling("dd")
+            if lab and dd:
+                out[lab] = dd.get_text(" ", strip=True)
+        return out
 
     def _pick_date(art):
-        # 1) ラベル優先
-        v = _dd_by_label(art, LABELS_DATE)
-        if v:
-            return v
-        # 2) フォールバック：dd 群を総当たり
-        for dd in art.select("dl.list-01 dd"):
+        dl = art.find("dl", class_="list-01")
+        if not dl:
+            return None
+        pairs = _dt_to_dd_texts(dl)
+        # 1) ラベルから優先取得
+        for lab in LABELS_DATE:
+            if lab in pairs and pairs[lab]:
+                return pairs[lab]
+        # 2) フォールバック：dd 群から日付パターン抽出
+        for dd in dl.find_all("dd"):
             txt = dd.get_text(" ", strip=True)
             if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?.*?(〜|～|-|－|—|–|―).*?\d{1,2}月?\d{1,2}日?', txt):
                 return txt
-            if re.search(r'\d{1,2}/\d{1,2}.*?(〜|～|-|－|—|–|―).*?\d{1,2}/\d{1,2}', txt):
-                return txt
-            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):
+            if re.search(r'\d{4}年?\d{1,2}月?\d{1,2}日?', txt):  # 単発日も許容
                 return txt
         return None
 
     def _pick_official_url(art, ctx):
-        # 1) dt=URL の a[href]
-        for div in art.select("dl.list-01 div"):
-            dt_el, dd_el = div.find("dt"), div.find("dd")
-            if not dt_el or not dd_el:
-                continue
-            if _norm_label(dt_el.get_text(strip=True)) == LABEL_URL:
-                a = dd_el.find("a", href=True)
-                if a and a.get("href"):
-                    u = _to_abs(a["href"], ctx)
+        dl = art.find("dl", class_="list-01")
+        if dl:
+            pairs = _dt_to_dd_texts(dl)
+            if LABEL_URL in pairs:
+                dd_text = pairs[LABEL_URL]
+                a = dl.find("a", href=True)
+                # dd 内の最初の a[href]
+                for a in dl.find_all("a", href=True):
+                    u = _to_abs(a.get("href"), ctx)
                     if u:
                         return u
-        # 2) 記事内の外部リンク先頭
+        # 記事内の外部リンク先頭
         for a in art.find_all("a", href=True):
-            u = _to_abs(a["href"], ctx)
+            u = _to_abs(a.get("href"), ctx)
             if u and not u.startswith(("https://www.bigsight.jp", "http://www.bigsight.jp")):
                 return u
         return None
 
-    rows = []
-    seen_pages = set()
-    page_url = url
-    referer = None
+    def _pick_venue(art):
+        dl = art.find("dl", class_="list-01")
+        if not dl:
+            return None
+        pairs = _dt_to_dd_texts(dl)
+        return pairs.get(LABEL_VENUE)
+
+    rows, seen_pages = [], set()
+    page_url, referer = url, None
 
     while page_url and page_url not in seen_pages:
         seen_pages.add(page_url)
@@ -291,11 +300,11 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
         _save_debug(f"bigsight_{len(seen_pages):02d}", html)
         soup = BeautifulSoup(html, "lxml")
 
-        arts = soup.select("main.event article.lyt-event-01")
+        arts = soup.select("article.lyt-event-01")
         logger.info("bigsight: %s -> articles=%d (accum=%d)", page_url, len(arts), len(rows))
 
         for art in arts:
-            # タイトル（h3 > a が無ければ h3 テキスト）
+            # タイトル
             h3 = art.find("h3", class_="hdg-01")
             a_title = h3.find("a", href=True) if h3 else None
             title = a_title.get_text(" ", strip=True) if a_title else (h3.get_text(" ", strip=True) if h3 else None)
@@ -306,7 +315,11 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
 
             # 公式URL・会場
             link = _pick_official_url(art, page_url)
-            venue = _dd_by_label(art, {LABEL_VENUE})
+            venue = _pick_venue(art)
+
+            # 取りこぼし検知のためのデバッグ
+            if not date_text:
+                logger.debug("bigsight: no date text for title=%r on page=%s", title, page_url)
 
             if title and (start or end):
                 rows.append({
@@ -318,7 +331,7 @@ def fetch_bigsight(url="https://www.bigsight.jp/visitor/event/search.php?page=1"
                     "url": link
                 })
 
-        # 次へ
+        # 次へ（Referer を直前ページに）
         next_a = soup.select_one("div.list-pager-01 p.next a[href]")
         referer = page_url
         page_url = _to_abs(next_a["href"], page_url) if next_a else None
@@ -418,4 +431,5 @@ def monthly_run(output_csv="events_agg.csv"):
 
 if __name__ == "__main__":
     monthly_run()
+
 
